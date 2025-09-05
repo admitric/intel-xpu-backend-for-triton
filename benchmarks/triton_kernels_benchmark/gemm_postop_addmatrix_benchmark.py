@@ -293,7 +293,7 @@ X_VALS = [x_val for x_val in X_VALS if is_enough_memory(x_val)]
         # argument names to use as an x-axis for the plot
         x_names=['B', 'M', 'K', 'N', 'dtype'],
         # different possible values for `x_name`
-        x_vals=X_VALS,
+        x_vals=[[4096, 8, 16384, 128, torch.int8]],
         line_arg='provider',
         # argument name whose value corresponds to a different line in the plot
         # possible values for `line_arg``
