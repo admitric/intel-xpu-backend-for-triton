@@ -147,7 +147,7 @@ class Autotuner(KernelInterface):
                 config.pre_hook(full_nargs)
             self.pre_hook(full_nargs)
             try:
-                self.fn.run(
+                res = self.fn.run(
                     *args,
                     **current,
                 )
@@ -159,8 +159,12 @@ class Autotuner(KernelInterface):
                     raise
 
             self.post_hook(full_nargs, exception=None)
+            return res
 
         try:
+            pgm = kernel_call()
+            if verbose:
+                print(f"Autotuning kernel {self.base_fn.__name__} with config {config}, cache dir: {pgm.metadata.cache_dir}")
             return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
         except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as e:
             if verbose:
