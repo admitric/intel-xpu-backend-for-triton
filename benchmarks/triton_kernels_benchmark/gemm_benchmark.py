@@ -357,7 +357,7 @@ def get_benchmark(
             # argument names to use as an x-axis for the plot
             x_names=['B', 'M', 'N', 'K'],
             # different possible values for `x_name`
-            x_vals=X_VALS,
+            x_vals=[[1, 8192, 4096, 4096]],
             line_arg='provider',
             # argument name whose value corresponds to a different line in the plot
             # possible values for `line_arg``
