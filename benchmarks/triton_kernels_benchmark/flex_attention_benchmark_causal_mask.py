@@ -33,7 +33,11 @@ def get_flex_attn_fwd_configs(*args, **kwargs):  # pylint: disable=unused-argume
         FlexConfig(128, 64, 2, 8),
         FlexConfig(128, 32, 2, 16),
         FlexConfig(128, 32, 2, 8),
+        FlexConfig(64, 32, 2, 4)
     ]
+#    configs = [FlexConfig(M, N, stages, warps) for M in [16, 32, 64, 128] for N in [16, 32, 64, 128] for stages in [2, 4, 8] for warps in [1, 2, 4, 8] if M * N * stages * warps <= 1024 * 8]
+    override_configs = [FlexConfig(64, 32, 2, 4)]
+    configs = override_configs
     return configs
 
 
@@ -144,7 +148,7 @@ if 'B580' in torch.xpu.get_device_name():
 @benchmark_suite.perf_report(
     benchmark_suite.Benchmark(
         x_names=['Z', 'H_q', 'H_kv', 'N_CTX_q', 'N_CTX_kv', 'D_HEAD_qk', 'D_HEAD_v', 'MODE'],
-        x_vals=[[1, 32, 8, 1, 1024 + 64, 128, 128, 'fwd']],
+        x_vals=[[1, 128, 1, 512, 1664, 64, 512, 'fwd']],
         line_arg='provider',
         line_vals=['triton', 'sycl-tla', 'onednn'],
         line_names=['Triton', 'SYCL-TLA', 'OneDNN'],
