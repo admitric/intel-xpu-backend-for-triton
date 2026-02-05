@@ -3,6 +3,7 @@
 #include "intel/include/Dialect/TritonIntelGPU/Transforms/Passes.h"
 #include "intel/include/Dialect/TritonIntelGPU/Transforms/Utility.h"
 #include "intel/include/Utils/Utility.h"
+#include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
@@ -49,6 +50,51 @@ private:
       axisInfoAnalysis.getAxisInfo(ptr)->print(llvm::dbgs().indent(2));
       llvm::dbgs() << "\n";
     });
+
+    // Skip layout conversion for indirect/gather access patterns.
+    // When the address computation involves loaded indices, the memory access
+    // is scattered regardless of thread layout, so conversion provides no
+    // coalescing benefit but adds expensive SLM shuffling overhead.
+
+    // Skip if this load's offset depends on another load (data load
+    // in gather pattern).
+    if (auto addPtrOp = dyn_cast_or_null<tt::AddPtrOp>(ptr.getDefiningOp())) {
+      SetVector<Operation *> slice;
+      BackwardSliceOptions opt;
+      opt.omitBlockArguments = true;
+      (void)getBackwardSlice(addPtrOp.getOffset(), &slice, opt);
+
+      if (llvm::any_of(slice, [](Operation *op) { return isa<tt::LoadOp>(op); })) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[" DEBUG_TYPE "]: Skipping coalescing for data load "
+                   << "with indirect indexing: " << *op << "\n");
+        return;
+      }
+    }
+
+    // Skip if this load's result is used in another memory op's address
+    // computation (index load in gather/scatter pattern).
+    if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
+      SetVector<Operation *> forwardSlice;
+      ForwardSliceOptions fwdOpt;
+      fwdOpt.filter = [](Operation *sliceOp) {
+        return !isa<tt::LoadOp, tt::StoreOp>(sliceOp);
+      };
+      getForwardSlice(loadOp.getResult(), &forwardSlice, fwdOpt);
+
+      if (llvm::any_of(forwardSlice, [](Operation *fwdOp) {
+        auto addPtrOp = dyn_cast<tt::AddPtrOp>(fwdOp);
+        return addPtrOp &&
+               llvm::any_of(addPtrOp.getResult().getUsers(), [](Operation *user) {
+                 return isa<tt::LoadOp, tt::StoreOp>(user);
+               });
+      })){
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[" DEBUG_TYPE "]: Skipping coalescing for load "
+                   << "of another memory operation's address: " << *op << "\n");
+        return;
+      }
+    }
 
     const auto &contiguity = axisInfoAnalysis.getAxisInfo(ptr)->getContiguity();
     SmallVector<unsigned> order = getOrderFromContiguity(contiguity);

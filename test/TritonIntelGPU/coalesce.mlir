@@ -623,3 +623,41 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return
   }
 }
+
+// -----
+
+// COM: Test that indirect access patterns skip coalescing: both for index load and data load.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @index_load_skip_coalesce
+  tt.func @index_load_skip_coalesce(
+      %idx_ptr: !tt.ptr<i64> {tt.divisibility = 16 : i32},
+      %data_ptr: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+      %out_ptr: !tt.ptr<f16> {tt.divisibility = 16 : i32}) {
+
+    %cst_16 = arith.constant dense<16> : tensor<1024x1xi64, #blocked>
+    %row_idx = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %row_idx_exp = tt.expand_dims %row_idx {axis = 1 : i32} : tensor<1024xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<1024x1xi32, #blocked>
+
+    %idx_ptr_splat = tt.splat %idx_ptr : !tt.ptr<i64> -> tensor<1024x1x!tt.ptr<i64>, #blocked>
+    %idx_ptr_offset = tt.addptr %idx_ptr_splat, %row_idx_exp : tensor<1024x1x!tt.ptr<i64>, #blocked>, tensor<1024x1xi32, #blocked>
+
+    // CHECK-NOT: ttg.convert_layout {{.*}}
+    // CHECK: [[IDX_LOAD:%.*]] = tt.load {{.*}} : tensor<1024x1x!tt.ptr<i64>
+    %loaded_indices = tt.load %idx_ptr_offset : tensor<1024x1x!tt.ptr<i64>, #blocked>
+
+    %scaled_indices = arith.muli %loaded_indices, %cst_16 : tensor<1024x1xi64, #blocked>
+    %data_ptr_splat = tt.splat %data_ptr : !tt.ptr<f16> -> tensor<1024x1x!tt.ptr<f16>, #blocked>
+    %data_ptr_indirect = tt.addptr %data_ptr_splat, %scaled_indices : tensor<1024x1x!tt.ptr<f16>, #blocked>, tensor<1024x1xi64, #blocked>
+
+    // CHECK-NOT: ttg.convert_layout {{.*}}
+    // CHECK: tt.load {{.*}} : tensor<1024x1x!tt.ptr<f16>
+    %data = tt.load %data_ptr_indirect : tensor<1024x1x!tt.ptr<f16>, #blocked>
+
+    %out_ptr_splat = tt.splat %out_ptr : !tt.ptr<f16> -> tensor<1024x1x!tt.ptr<f16>, #blocked>
+    %out_ptr_offset = tt.addptr %out_ptr_splat, %row_idx_exp : tensor<1024x1x!tt.ptr<f16>, #blocked>, tensor<1024x1xi32, #blocked>
+    tt.store %out_ptr_offset, %data : tensor<1024x1x!tt.ptr<f16>, #blocked>
+
+    tt.return
+  }
+}
