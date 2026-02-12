@@ -1758,24 +1758,13 @@ struct LoadOpToBlockIOConversion
         offsetX = b.add(baseOffsets[c], offsets[c].second);
         offsetY = b.add(baseOffsets[r], offsets[r].second);
 
-        // To prevent triggering hardware boundary protection, expand the base
-        // shape sufficiently when boundary check is absent.
-        SetVector<unsigned> boundaryCheck(op.getBoundaryCheck().begin(),
-                                          op.getBoundaryCheck().end());
-        if (!boundaryCheck.contains(c)) {
-          adjustedBaseWidth = b.i32_val(
-              std::max(64u, vBlocks * tileWidth * (packedElemSizeInBits / 8)));
-          // The offsetX is number of elements instead of packed elements.
-          addrElem = b.gep(ptr_ty(ctx, 1), eltTy, addrElem, offsetX);
-          offsetX = b.i32_val(0);
-        }
-        if (!boundaryCheck.contains(r)) {
-          adjustedBaseHeight = b.i32_val(tileHeight);
-          // Use i8_ty as pitch is in number of bytes.
-          Value off = b.mul(offsetY, pitch);
-          addrElem = b.gep(ptr_ty(ctx, 1), i8_ty, addrElem, off);
-          offsetY = b.i32_val(0);
-        }
+        // When boundary checks are absent, we can safely use the original
+        // tensor dimensions and non-zero coordinates. This preserves a shared
+        // base pointer across sub-tiles, enabling IGC's decomposition pass to
+        // hoist address payload creation out of loops. The hardware will not
+        // trigger boundary protection since all accesses are known in-bounds.
+        // No adjustments are needed - use baseWidth, baseHeight, offsetX, and
+        // offsetY as-is.
       } else {
         addrElem = targetInfo.shuffleIdx(rewriter, loc, addrElem, 0);
 
@@ -2324,25 +2313,13 @@ struct StoreOpToBlockIOConversion
         offsetX = b.add(offsetBaseX, offsets[colDim].second);
         offsetY = b.add(offsetBaseY, offsets[rowDim].second);
 
-        // To prevent triggering hardware boundary protection, expand the base
-        // shape sufficiently when boundary check is absent.
-        SetVector<unsigned> boundaryCheck(op.getBoundaryCheck().begin(),
-                                          op.getBoundaryCheck().end());
-
-        if (!boundaryCheck.contains(colDim)) {
-          adjustedBaseWidth = b.i32_val(
-              std::max(64u, vBlocks * tileWidth * (packedElemSizeInBits / 8)));
-          // The offsetX is number of elements instead of packed elements.
-          addrElem = b.gep(ptr_ty(ctx, 1), eltTy, addrElem, offsetX);
-          offsetX = b.i32_val(0);
-        }
-        if (!boundaryCheck.contains(rowDim)) {
-          adjustedBaseHeight = b.i32_val(tileHeight);
-          // Use i8_ty as pitch is in number of bytes.
-          Value off = b.mul(offsetY, pitch);
-          addrElem = b.gep(ptr_ty(ctx, 1), i8_ty, addrElem, off);
-          offsetY = b.i32_val(0);
-        }
+        // When boundary checks are absent, we can safely use the original
+        // tensor dimensions and non-zero coordinates. This preserves a shared
+        // base pointer across sub-tiles, enabling IGC's decomposition pass to
+        // hoist address payload creation out of loops. The hardware will not
+        // trigger boundary protection since all accesses are known in-bounds.
+        // No adjustments are needed - use baseWidth, baseHeight, offsetX, and
+        // offsetY as-is.
       } else {
         addrElem = targetInfo.shuffleIdx(rewriter, loc, addrElem, 0);
 
