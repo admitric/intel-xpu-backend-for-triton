@@ -237,6 +237,9 @@ class CompileTimer:
 
 
 def compile(src, target=None, options=None, _env_vars=None):
+    from ..runtime.autotuner import _patch_inductor_log_results
+    _patch_inductor_log_results()
+
     compilation_listener = knobs.compilation.listener
     if compilation_listener:
         timer = CompileTimer()
