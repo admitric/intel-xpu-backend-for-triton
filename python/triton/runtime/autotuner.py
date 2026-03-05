@@ -498,3 +498,107 @@ def heuristics(values):
         return Heuristics(fn, fn.arg_names, values)
 
     return decorator
+
+
+# ---------------------------------------------------------------------------
+# PyTorch inductor monkey-patch: add cache_dir to inductor autotuning output
+# ---------------------------------------------------------------------------
+#
+# PyTorch inductor's autotuner (AlgorithmSelectorCache.log_results) prints
+# timing results for each Triton template choice but omits the Triton cache
+# directory where IGC shader dumps land.  The patch below appends cache_dir
+# information after the standard output so that autotuner-selected configs
+# can be correlated with their compilation artifacts.
+#
+# Applied lazily on first ``triton.compile()`` call, at which point the
+# inductor modules are guaranteed to be loaded.
+# ---------------------------------------------------------------------------
+
+_inductor_patched = False
+
+
+def _get_triton_cache_dir(choice):
+    """Extract Triton cache directory from a benchmarked TritonTemplateCaller."""
+    import os
+
+    from torch._inductor.codecache import PyCodeCache
+    from torch._inductor.runtime.triton_heuristics import (
+        triton_cache_dir,
+        triton_hash_to_path_key,
+    )
+
+    mod = PyCodeCache.load_by_key_path(
+        choice.bmreq.module_cache_key, choice.bmreq.module_path
+    )
+    kernel = getattr(mod, choice.bmreq.kernel_name, None)
+    if kernel is None or not kernel.compile_results:
+        return None
+    result = kernel.compile_results[0]
+    compiled_kernel = result.kernel
+    # CompiledKernel keeps full metadata including cache_dir
+    metadata = getattr(compiled_kernel, "metadata", None)
+    if metadata is not None:
+        return getattr(metadata, "cache_dir", None)
+    # StaticallyLaunchedXpuKernel/CudaKernel: reconstruct from hash
+    kernel_hash = getattr(compiled_kernel, "hash", None)
+    if kernel_hash is not None:
+        device = result.compile_meta.get("device", 0)
+        return os.path.join(
+            triton_cache_dir(device),
+            triton_hash_to_path_key(kernel_hash),
+        )
+    return None
+
+
+def _patch_inductor_log_results():
+    """Patch inductor's AlgorithmSelectorCache.log_results to print cache_dir."""
+    global _inductor_patched
+    if _inductor_patched:
+        return
+    _inductor_patched = True
+
+    import functools
+    import logging
+    import sys
+
+    log = logging.getLogger(__name__)
+
+    try:
+        from torch._inductor.select_algorithm import (
+            AlgorithmSelectorCache,
+            TritonTemplateCaller,
+        )
+        from torch._inductor import config
+        from torch._inductor.select_algorithm import PRINT_AUTOTUNE
+    except ImportError:
+        return
+
+    original = AlgorithmSelectorCache.log_results
+
+    @staticmethod
+    @functools.wraps(original)
+    def log_results(name, input_nodes, timings, *args, **kwargs):
+        original(name, input_nodes, timings, *args, **kwargs)
+        if not (config.max_autotune or config.max_autotune_gemm) or not PRINT_AUTOTUNE:
+            return
+        n = config.autotune_num_choices_displayed
+        if n == 0:
+            return
+        top_k = sorted(timings, key=timings.__getitem__)[:n]
+        for choice in top_k:
+            if not isinstance(choice, TritonTemplateCaller) or not timings[choice]:
+                continue
+            try:
+                cache_dir = _get_triton_cache_dir(choice)
+            except Exception:
+                log.debug("Failed to extract cache_dir for %s", choice.name, exc_info=True)
+                cache_dir = None
+            if cache_dir:
+                sys.stderr.write(f"    {choice.name} cache_dir: {cache_dir}\n")
+            else:
+                sys.stderr.write(
+                    f"    {choice.name} module_path: {choice.bmreq.module_path}\n"
+                )
+
+    AlgorithmSelectorCache.log_results = log_results
+    log.debug("Patched AlgorithmSelectorCache.log_results with cache_dir logging")
