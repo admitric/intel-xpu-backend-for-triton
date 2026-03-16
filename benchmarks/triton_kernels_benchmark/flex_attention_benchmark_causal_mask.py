@@ -35,9 +35,6 @@ def get_flex_attn_fwd_configs(*args, **kwargs):  # pylint: disable=unused-argume
         FlexConfig(128, 32, 2, 8),
         FlexConfig(64, 32, 2, 4)
     ]
-#    configs = [FlexConfig(M, N, stages, warps) for M in [16, 32, 64, 128] for N in [16, 32, 64, 128] for stages in [2, 4, 8] for warps in [1, 2, 4, 8] if M * N * stages * warps <= 1024 * 8]
-    override_configs = [FlexConfig(64, 32, 2, 4)]
-    configs = override_configs
     return configs
 
 
