@@ -106,6 +106,8 @@ def get_git_commit_hash(length=8):
         return ""
 
 
+_skip_native = os.getenv("TRITON_BENCHMARKS_SKIP_NATIVE", "0") == "1"
+
 setup(
     name="triton-kernels-benchmark",
     version="3.7.2" + get_git_commit_hash(),
@@ -119,17 +121,19 @@ setup(
         "matplotlib",
     ],
     package_dir={"triton_kernels_benchmark": "triton_kernels_benchmark"},
-    package_data={"triton_kernels_benchmark": [
-        "sycl_tla_kernel.cpython-*.so",
-        "onednn_kernel.cpython-*.so",
-    ]},
+    package_data={
+        "triton_kernels_benchmark": [
+            "sycl_tla_kernel.cpython-*.so",
+            "onednn_kernel.cpython-*.so",
+        ]
+    } if not _skip_native else {},
     cmdclass={
         "build_ext": build_ext,
-    },
+    } if not _skip_native else {},
     ext_modules=[
         CMakeExtension("triton_kernels_benchmark.sycl_tla_kernel"),
         CMakeExtension("triton_kernels_benchmark.onednn_kernel"),
-    ],
+    ] if not _skip_native else [],
     entry_points={
         "console_scripts": [
             "triton-benchmarks = triton_kernels_benchmark.benchmark_utils:main",

@@ -213,11 +213,13 @@ def _apply_flex_overrides():
     AD_OVERRIDE_CONFIGS: Python literal evaluating to a list of FlexConfig.
         Empty string means use defaults (no override).
     AD_FLEX_DECODE_CONFIGS: Python literal evaluating to a list of FlexDecodeConfig.
+    AD_BWD_OVERRIDE_CONFIGS: Python literal evaluating to a list of FlexBwDConfig.
     """
     override_str = os.environ.get("AD_OVERRIDE_CONFIGS")  # None if not set
     decode_str = os.environ.get("AD_FLEX_DECODE_CONFIGS")
+    bwd_str = os.environ.get("AD_BWD_OVERRIDE_CONFIGS")
 
-    if override_str is None and decode_str is None:
+    if override_str is None and decode_str is None and bwd_str is None:
         return
 
     try:
@@ -238,6 +240,14 @@ def _apply_flex_overrides():
             flex_attn.V.choices.get_flex_decode_configs = lambda *a, **kw: decode_configs
         except ImportError:
             print("[ad_run_benchmark] WARNING: Could not import FlexDecodeConfig; skipping decode config override")
+
+    if bwd_str:
+        try:
+            from torch._inductor.template_heuristics.triton import FlexBwDConfig
+            bwd_configs = eval(bwd_str)  # noqa: S307
+            flex_attn.V.choices.get_flex_attn_bwd_configs = lambda *a, **kw: bwd_configs
+        except ImportError:
+            print("[ad_run_benchmark] WARNING: Could not import FlexBwDConfig; skipping bwd config override")
 
 
 def _coerce_value(v: str):
@@ -334,6 +344,42 @@ def _force_autotune_config(module):
         print("[ad_run_benchmark] WARNING: No Autotuner objects found in module")
 
 
+def _patch_compile_only():
+    """Replace do_bench with a stub that calls fn() once for compilation.
+
+    In compile-only mode, we want to trigger kernel compilation (generating
+    Triton and IGC dumps) without running the full measurement loop.  The
+    stub calls fn() exactly once — enough to trigger torch.compile JIT and
+    IGC shader compilation — then returns zero-valued stats.
+    """
+    import triton_kernels_benchmark as _bm
+
+    # Use a tiny non-zero time (1e-3 ms) to avoid division-by-zero in
+    # benchmark functions that compute GB/s = bytes / (ms * 1e-3).
+    _DUMMY_MS = 1e-3
+
+    def _make_compile_stub(quantiles=None, **_kw):
+        """Create a do_bench replacement that knows the expected return shape."""
+        def _stub(fn, *_args, **_kwargs):
+            try:
+                fn()
+            except Exception as e:
+                print(f"[compile_only] Execution error (may be expected): {e}")
+            if quantiles is not None:
+                # quantile values + mean + cv
+                return [_DUMMY_MS] * len(quantiles) + [_DUMMY_MS, 0.0]
+            return _DUMMY_MS
+        return _stub
+
+    # Patch get_do_bench so new partials use the stub
+    _bm.get_do_bench = lambda *a, **kw: _make_compile_stub(**kw)
+
+    # Patch do_bench directly for callers that don't go through get_do_bench
+    _bm.do_bench = _make_compile_stub(quantiles=[0.5, 0.0, 1.0])
+
+    print("[compile_only] Patched do_bench — kernels will compile but not benchmark")
+
+
 def _filter_masks(bench):
     """Filter x_vals to only include specified mask types.
 
@@ -425,7 +471,11 @@ def main():
     if os.environ.get("AD_FLEX_MASKS"):
         _filter_masks(bench)
 
-    # 10. Run the benchmark
+    # 10. Compile-only mode: replace do_bench with single-call stub
+    if os.environ.get("AD_COMPILE_ONLY") == "1":
+        _patch_compile_only()
+
+    # 11. Run the benchmark
     mark.run(show_plots=False, print_data=True)
 
 
