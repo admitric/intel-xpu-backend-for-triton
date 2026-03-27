@@ -375,19 +375,19 @@ def _patch_compile_only():
         # afterwards for the L0 native-device path — skip them entirely.
         # With load_binary patched out, L0's IGC is never invoked, so
         # IGC_ShaderDumpEnable can stay set (no native dumps to overwrite).
-        from triton.backends.intel.driver import XPULauncher
+        from triton.backends.intel.driver import XPULauncher, XPUUtilsSharedLibrary
         def _noop_launcher(self, *args):
             print("[compile_only] DEBUG: XPULauncher.__call__ intercepted (no-op)")
         XPULauncher.__call__ = _noop_launcher
 
-        # Patch load_binary on the driver utils singleton instance.
-        import triton
-        _utils = triton.runtime.driver.active.utils
-        _orig_load_binary = _utils.load_binary
-        def _noop_load_binary(*args):
+        # Patch load_binary on XPUUtilsSharedLibrary (the class that owns it).
+        # Cannot access driver.active.utils here — it triggers L0 device init
+        # which segfaults with ProductFamilyOverride=cri on non-CRI hardware.
+        _orig_load_binary = XPUUtilsSharedLibrary.load_binary
+        def _noop_load_binary(self, *args):
             print("[compile_only] DEBUG: load_binary intercepted (no-op)")
             return (None, None, 0, 0, 0)
-        _utils.load_binary = _noop_load_binary
+        XPUUtilsSharedLibrary.load_binary = _noop_load_binary
 
         # Patch assert_close to skip verification — cross-compiled kernels
         # can't run on the native device anyway.
