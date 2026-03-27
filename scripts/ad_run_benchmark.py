@@ -354,25 +354,27 @@ def _patch_compile_only():
 
     When cross-compiling (TRITON_INTEL_DEVICE_ARCH is set), additional
     patches are applied:
-    - IGC_ShaderDumpEnable is unset so L0 doesn't dump for the native device
-      (ocloc receives dump flags via -igc_opts inline, unaffected by env).
     - XPULauncher.__call__ is patched to a no-op so the kernel is never
-      dispatched to the GPU.  The JIT pipeline (including ocloc) still runs
-      fully during compilation — only the final GPU launch is skipped.
+      dispatched to the GPU.
+    - XPUUtils.load_binary is patched to a no-op so L0 zeModuleCreate is
+      never called (no native-device recompilation, no native dumps).
     - assert_close is patched to a no-op (verification is meaningless for
       cross-compiled kernels).
+    The JIT pipeline (including ocloc) still runs fully during compilation,
+    producing all target-device dumps.  IGC_ShaderDumpEnable stays set
+    since L0's IGC is never invoked.
     """
     import triton_kernels_benchmark as _bm
 
     _cross_compile = bool(os.environ.get("TRITON_INTEL_DEVICE_ARCH"))
     if _cross_compile:
-        os.environ.pop("IGC_ShaderDumpEnable", None)
-
         # Patch XPULauncher to skip GPU dispatch and load_binary to skip
         # L0 module creation.  The JIT compilation pipeline (TTIR→SPV→ocloc)
         # runs as Python/subprocess code during the first fn() call, producing
         # all dumps.  load_binary and XPULauncher.__call__ are only invoked
         # afterwards for the L0 native-device path — skip them entirely.
+        # With load_binary patched out, L0's IGC is never invoked, so
+        # IGC_ShaderDumpEnable can stay set (no native dumps to overwrite).
         from triton.backends.intel.driver import XPULauncher, XPUUtils
         XPULauncher.__call__ = lambda self, *args: None
         XPUUtils.load_binary = lambda self, *args: (None, None, 0, 0, 0)
@@ -382,7 +384,7 @@ def _patch_compile_only():
         _bm.assert_close = lambda *a, **kw: None
 
         print("[compile_only] Cross-compile mode: patched XPULauncher + load_binary "
-              "(no GPU dispatch), disabled IGC_ShaderDumpEnable")
+              "(no GPU dispatch)")
 
     # Use a tiny non-zero time (1e-3 ms) to avoid division-by-zero in
     # benchmark functions that compute GB/s = bytes / (ms * 1e-3).
