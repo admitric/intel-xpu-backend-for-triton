@@ -350,9 +350,26 @@ def _patch_compile_only():
     In compile-only mode, we want to trigger kernel compilation (generating
     Triton and IGC dumps) without running the full measurement loop.  The
     stub calls fn() exactly once — enough to trigger torch.compile JIT and
-    IGC shader compilation — then returns zero-valued stats.
+    the ocloc compilation that produces IGC dumps for the target device.
+
+    When cross-compiling (TRITON_INTEL_DEVICE_ARCH is set), the fn() call
+    also triggers a Level Zero runtime recompilation for the *native* device.
+    To prevent native dumps from overwriting cross-compilation dumps, we
+    unset IGC_ShaderDumpEnable from the environment.  This is safe because
+    ocloc receives dump flags via -igc_opts inline, not from the env var.
     """
     import triton_kernels_benchmark as _bm
+
+    _cross_compile = bool(os.environ.get("TRITON_INTEL_DEVICE_ARCH"))
+    if _cross_compile:
+        # Disable IGC_ShaderDumpEnable for the L0 runtime path so the native
+        # device recompilation doesn't overwrite cross-compiled dumps.  The
+        # ocloc path passes ShaderDumpEnable=1 via -igc_opts inline, so it
+        # still dumps correctly.  Other IGC dump keys (DumpCodeScheduling,
+        # DumpLatencyHidingEarly) are kept because ocloc reads them from env.
+        os.environ.pop("IGC_ShaderDumpEnable", None)
+        print("[compile_only] Cross-compile mode: disabled IGC_ShaderDumpEnable "
+              "to prevent native L0 dumps from overwriting target dumps")
 
     # Use a tiny non-zero time (1e-3 ms) to avoid division-by-zero in
     # benchmark functions that compute GB/s = bytes / (ms * 1e-3).
@@ -377,7 +394,8 @@ def _patch_compile_only():
     # Patch do_bench directly for callers that don't go through get_do_bench
     _bm.do_bench = _make_compile_stub(quantiles=[0.5, 0.0, 1.0])
 
-    print("[compile_only] Patched do_bench — kernels will compile but not benchmark")
+    mode = "cross-compile" if _cross_compile else "native"
+    print(f"[compile_only] Patched do_bench — kernels will compile but not benchmark ({mode})")
 
 
 def _filter_masks(bench):
