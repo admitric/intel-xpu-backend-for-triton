@@ -165,6 +165,155 @@ def _mock_native_modules():
             sys.modules[mod_name] = types.ModuleType(mod_name)
 
 
+def _mock_gpu_for_cross_compile():
+    """Mock GPU subsystem for cross-compilation on machines without an Intel GPU.
+
+    Three layers of mocking:
+    1. torch.xpu module functions (called at benchmark module import time)
+    2. Triton XPUDriver methods (called during JIT compilation)
+    3. Tensor factory redirect: device='xpu' → device='cpu'
+
+    Must be called BEFORE importing any benchmark module.
+    Controlled by AD_MOCK_GPU=1 env var.
+    """
+    import functools
+    import torch
+    from unittest.mock import MagicMock
+
+    arch = os.environ.get("TRITON_INTEL_DEVICE_ARCH", "unknown")
+    print(f"[mock_gpu] Mocking GPU subsystem for cross-compilation (arch={arch})")
+
+    # Force XPU backend to avoid "2 active drivers" error when CUDA is
+    # also available on the host.
+    os.environ.setdefault("TRITON_DEFAULT_BACKEND", "intel")
+
+    # ---- Layer 1: torch.xpu function mocks ----
+
+    # Mock device properties object (returned by torch.xpu.get_device_properties)
+    _mock_dev_props = MagicMock()
+    _mock_dev_props.total_memory = 128 * 1024**3  # 128 GB
+    _mock_dev_props.max_work_group_size = 1024
+    _mock_dev_props.name = f"Cross-compile ({arch})"
+
+    # Mock device capability dict (returned by torch.xpu.get_device_capability)
+    _mock_dev_cap = {
+        "architecture": 0,  # dummy, overridden by TRITON_INTEL_DEVICE_ARCH
+        "device_id": 0,
+        "gpu_subslice_count": 64,
+        "max_work_group_size": 1024,
+        "max_num_sub_groups": 64,
+        "sub_group_sizes": [16, 32],
+    }
+
+    # Mock stream / event objects
+    _mock_stream = MagicMock()
+    _mock_stream.sycl_queue = 0  # dummy sycl_queue — never used (launcher is no-op)
+
+    _mock_event = MagicMock()
+    _mock_event.elapsed_time = MagicMock(return_value=0.0)
+
+    torch.xpu.is_available = lambda: True
+    torch.xpu.device_count = lambda: 1
+    torch.xpu.current_device = lambda: 0
+    torch.xpu.get_device_name = lambda *a, **kw: f"Cross-compile ({arch})"
+    torch.xpu.get_device_properties = lambda *a, **kw: _mock_dev_props
+    torch.xpu.get_device_capability = lambda *a, **kw: _mock_dev_cap
+    torch.xpu.synchronize = lambda *a, **kw: None
+    torch.xpu.empty_cache = lambda *a, **kw: None
+    torch.xpu.current_stream = lambda *a, **kw: _mock_stream
+    torch.xpu.Event = lambda *a, **kw: _mock_event
+
+    print("[mock_gpu] Layer 1: torch.xpu functions mocked")
+
+    # ---- Layer 2: Triton XPUDriver mocks ----
+
+    from triton.backends.intel.driver import XPUDriver
+    from triton.backends.compiler import GPUTarget
+
+    # Build mock device properties dict for get_current_target
+    extensions_str = os.environ.get("TRITON_INTEL_DEVICE_EXTENSIONS", "")
+    target_props = dict(_mock_dev_cap)
+    target_props["arch"] = arch
+    target_props["__intel_already_queried_extensions__"] = True
+    if extensions_str:
+        for ext in extensions_str.split():
+            target_props[ext] = True
+    _mock_target = GPUTarget("xpu", target_props, warp_size=32)
+
+    # Mock utils object (prevents __getattr__ from creating XPUUtils which
+    # would call init_devices → segfault without GPU)
+    class _MockUtils:
+        def get_device_properties(self, dev=0):
+            return {"max_work_group_size": 1024}
+        def get_current_device(self):
+            return 0
+
+    # Patch XPUDriver methods
+    XPUDriver.get_current_device = lambda self=None: 0
+    XPUDriver.get_current_stream = lambda self=None, dev=None: _mock_stream.sycl_queue
+    XPUDriver.get_current_target = lambda self=None: _mock_target
+    XPUDriver.get_active_torch_device = lambda self=None: torch.device("cpu")
+
+    # Pre-set utils on the class to prevent lazy XPUUtils() init via __getattr__
+    # XPUDriver.__getattr__ checks name == "utils" and creates XPUUtils() on first access
+    XPUDriver.utils = _MockUtils()
+
+    print(f"[mock_gpu] Layer 2: XPUDriver mocked (target={_mock_target})")
+
+    # ---- Layer 3: Redirect device='xpu' → device='cpu' ----
+
+    def _redirect_device(device):
+        """Convert xpu device references to cpu."""
+        if device is None:
+            return device
+        if isinstance(device, torch.device):
+            if device.type == "xpu":
+                return torch.device("cpu")
+        elif isinstance(device, str):
+            if "xpu" in device:
+                return device.replace("xpu", "cpu")
+        return device
+
+    # Patch tensor factory functions
+    _factory_names = (
+        "randn", "zeros", "ones", "empty", "full", "rand", "arange",
+        "tensor", "randn_like", "zeros_like", "ones_like", "empty_like",
+    )
+    for fn_name in _factory_names:
+        orig = getattr(torch, fn_name, None)
+        if orig is None:
+            continue
+
+        def _make_wrapper(orig_fn):
+            @functools.wraps(orig_fn)
+            def wrapper(*args, **kwargs):
+                if "device" in kwargs:
+                    kwargs["device"] = _redirect_device(kwargs["device"])
+                return orig_fn(*args, **kwargs)
+            return wrapper
+
+        setattr(torch, fn_name, _make_wrapper(orig))
+
+    # Patch Tensor.to() — handles tensor.to('xpu') and tensor.to(device='xpu')
+    _orig_to = torch.Tensor.to
+
+    def _mock_to(self, *args, **kwargs):
+        if args:
+            first = args[0]
+            if isinstance(first, (str, torch.device)):
+                args = (_redirect_device(first),) + args[1:]
+        if "device" in kwargs:
+            kwargs["device"] = _redirect_device(kwargs["device"])
+        return _orig_to(self, *args, **kwargs)
+
+    torch.Tensor.to = _mock_to
+
+    # Patch Tensor.xpu() — returns self (tensor stays on cpu)
+    torch.Tensor.xpu = lambda self, *a, **kw: self
+
+    print("[mock_gpu] Layer 3: tensor factories redirect xpu → cpu")
+
+
 def _filter_triton_only(bench):
     """Patch a Benchmark's line_vals/line_names to keep only triton."""
     triton_idx = [
@@ -472,6 +621,10 @@ def main():
 
     # 1. Mock native extensions before any benchmark import
     _mock_native_modules()
+
+    # 1.5. Mock GPU subsystem for cross-compilation on GPU-less machines
+    if os.environ.get("AD_MOCK_GPU") == "1":
+        _mock_gpu_for_cross_compile()
 
     # 2. Set env vars before import (some modules read them at import time)
     for k, v in spec.get("env_before_import", {}).items():
