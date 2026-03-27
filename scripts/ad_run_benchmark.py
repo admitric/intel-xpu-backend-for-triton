@@ -352,24 +352,37 @@ def _patch_compile_only():
     stub calls fn() exactly once — enough to trigger torch.compile JIT and
     the ocloc compilation that produces IGC dumps for the target device.
 
-    When cross-compiling (TRITON_INTEL_DEVICE_ARCH is set), the fn() call
-    also triggers a Level Zero runtime recompilation for the *native* device.
-    To prevent native dumps from overwriting cross-compilation dumps, we
-    unset IGC_ShaderDumpEnable from the environment.  This is safe because
-    ocloc receives dump flags via -igc_opts inline, not from the env var.
+    When cross-compiling (TRITON_INTEL_DEVICE_ARCH is set), additional
+    patches are applied:
+    - IGC_ShaderDumpEnable is unset so L0 doesn't dump for the native device
+      (ocloc receives dump flags via -igc_opts inline, unaffected by env).
+    - XPULauncher.__call__ is patched to a no-op so the kernel is never
+      dispatched to the GPU.  The JIT pipeline (including ocloc) still runs
+      fully during compilation — only the final GPU launch is skipped.
+    - assert_close is patched to a no-op (verification is meaningless for
+      cross-compiled kernels).
     """
     import triton_kernels_benchmark as _bm
 
     _cross_compile = bool(os.environ.get("TRITON_INTEL_DEVICE_ARCH"))
     if _cross_compile:
-        # Disable IGC_ShaderDumpEnable for the L0 runtime path so the native
-        # device recompilation doesn't overwrite cross-compiled dumps.  The
-        # ocloc path passes ShaderDumpEnable=1 via -igc_opts inline, so it
-        # still dumps correctly.  Other IGC dump keys (DumpCodeScheduling,
-        # DumpLatencyHidingEarly) are kept because ocloc reads them from env.
         os.environ.pop("IGC_ShaderDumpEnable", None)
-        print("[compile_only] Cross-compile mode: disabled IGC_ShaderDumpEnable "
-              "to prevent native L0 dumps from overwriting target dumps")
+
+        # Patch XPULauncher to skip GPU dispatch and load_binary to skip
+        # L0 module creation.  The JIT compilation pipeline (TTIR→SPV→ocloc)
+        # runs as Python/subprocess code during the first fn() call, producing
+        # all dumps.  load_binary and XPULauncher.__call__ are only invoked
+        # afterwards for the L0 native-device path — skip them entirely.
+        from triton.backends.intel.driver import XPULauncher, XPUUtils
+        XPULauncher.__call__ = lambda self, *args: None
+        XPUUtils.load_binary = lambda self, *args: (None, None, 0, 0, 0)
+
+        # Patch assert_close to skip verification — cross-compiled kernels
+        # can't run on the native device anyway.
+        _bm.assert_close = lambda *a, **kw: None
+
+        print("[compile_only] Cross-compile mode: patched XPULauncher + load_binary "
+              "(no GPU dispatch), disabled IGC_ShaderDumpEnable")
 
     # Use a tiny non-zero time (1e-3 ms) to avoid division-by-zero in
     # benchmark functions that compute GB/s = bytes / (ms * 1e-3).
