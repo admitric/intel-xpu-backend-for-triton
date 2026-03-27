@@ -368,64 +368,31 @@ def _patch_compile_only():
 
     _cross_compile = bool(os.environ.get("TRITON_INTEL_DEVICE_ARCH"))
     if _cross_compile:
-        # Patch XPULauncher to skip GPU dispatch and load_binary to skip
-        # L0 module creation.  The JIT compilation pipeline (TTIR→SPV→ocloc)
-        # runs as Python/subprocess code during the first fn() call, producing
-        # all dumps.  load_binary and XPULauncher.__call__ are only invoked
-        # afterwards for the L0 native-device path — skip them entirely.
-        # With load_binary patched out, L0's IGC is never invoked, so
-        # IGC_ShaderDumpEnable can stay set (no native dumps to overwrite).
+        # Patch XPULauncher.__call__ to skip GPU dispatch.
         from triton.backends.intel.driver import XPULauncher
-        def _noop_launcher(self, *args):
-            print("[compile_only] DEBUG: XPULauncher.__call__ intercepted (no-op)")
-        XPULauncher.__call__ = _noop_launcher
+        XPULauncher.__call__ = lambda self, *args: None
 
-        # Patch _init_handles on CompiledKernel to skip L0 module creation.
-        # Cannot patch load_binary directly — it's set on the XPUUtils
-        # instance, and instantiating XPUUtils triggers L0 device init which
-        # segfaults with ProductFamilyOverride=cri on non-CRI hardware.
-        # _init_handles is called when the kernel is first launched; it calls
-        # load_binary and checks shared memory limits.  Replace it entirely.
+        # Patch _init_handles to skip L0 module creation (load_binary +
+        # shared memory checks).  Cannot patch load_binary directly — it's
+        # an instance attribute on XPUUtils, and instantiating XPUUtils
+        # triggers L0 device init which segfaults with ProductFamilyOverride
+        # pointing to non-native hardware.  _init_handles is the call site
+        # for load_binary; replacing it avoids all L0 interaction.
         from triton.compiler.compiler import CompiledKernel
         def _noop_init_handles(self):
             if self.module is not None:
                 return
-            print("[compile_only] DEBUG: _init_handles intercepted (no L0 module creation)")
             self.module = "dummy"
             self.function = None
-            self.n_regs = 0
-            self.n_spills = 0
-            self.n_max_threads = 0
+            self.n_regs = self.n_spills = self.n_max_threads = 0
         CompiledKernel._init_handles = _noop_init_handles
 
         # Patch assert_close to skip verification — cross-compiled kernels
         # can't run on the native device anyway.
         _bm.assert_close = lambda *a, **kw: None
 
-        # DEBUG: wrap subprocess.check_output to trace ocloc calls and
-        # check which libocloc.so is loaded.
-        import subprocess as _sp
-        _orig_check_output = _sp.check_output
-        def _debug_check_output(cmd, **kwargs):
-            if isinstance(cmd, list) and cmd and "ocloc" in str(cmd[0]):
-                print(f"[compile_only] DEBUG ocloc cmd: {' '.join(cmd[:10])}...")
-                # Check which libocloc.so ocloc will load
-                import subprocess as _sp2
-                ldd = _sp2.run(["ldd", cmd[0]], capture_output=True, text=True)
-                for line in ldd.stdout.splitlines():
-                    if "ocloc" in line or "igc" in line:
-                        print(f"[compile_only] DEBUG ldd: {line.strip()}")
-                # Report LD_LIBRARY_PATH (first 200 chars)
-                ldp = os.environ.get("LD_LIBRARY_PATH", "")
-                print(f"[compile_only] DEBUG LD_LIBRARY_PATH: {ldp[:200]}...")
-                # Also report IGC_DumpToCustomDir
-                print(f"[compile_only] DEBUG IGC_DumpToCustomDir={os.environ.get('IGC_DumpToCustomDir', 'NOT SET')}")
-                print(f"[compile_only] DEBUG IGC_ShaderDumpEnable={os.environ.get('IGC_ShaderDumpEnable', 'NOT SET')}")
-            return _orig_check_output(cmd, **kwargs)
-        _sp.check_output = _debug_check_output
-
-        print("[compile_only] Cross-compile mode: patched XPULauncher + load_binary "
-              "(no GPU dispatch) + ocloc debug tracing")
+        print("[compile_only] Cross-compile mode: patched XPULauncher + "
+              "_init_handles (no GPU dispatch, no L0 module creation)")
 
     # Use a tiny non-zero time (1e-3 ms) to avoid division-by-zero in
     # benchmark functions that compute GB/s = bytes / (ms * 1e-3).
@@ -438,17 +405,6 @@ def _patch_compile_only():
                 fn()
             except Exception as e:
                 print(f"[compile_only] Execution error (may be expected): {e}")
-            # DEBUG: check .platform in dump files after fn()
-            if _cross_compile:
-                import glob as _glob
-                dump_dir = os.environ.get("IGC_DumpToCustomDir", "")
-                if dump_dir:
-                    for asm in _glob.glob(os.path.join(dump_dir, "*.asm")):
-                        with open(asm) as _f:
-                            for line in _f:
-                                if ".platform" in line:
-                                    print(f"[compile_only] DEBUG dump platform: {os.path.basename(asm)}: {line.strip()}")
-                                    break
             if quantiles is not None:
                 # quantile values + mean + cv
                 return [_DUMMY_MS] * len(quantiles) + [_DUMMY_MS, 0.0]
