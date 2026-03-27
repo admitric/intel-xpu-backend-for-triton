@@ -376,15 +376,45 @@ def _patch_compile_only():
         # With load_binary patched out, L0's IGC is never invoked, so
         # IGC_ShaderDumpEnable can stay set (no native dumps to overwrite).
         from triton.backends.intel.driver import XPULauncher, XPUUtils
-        XPULauncher.__call__ = lambda self, *args: None
-        XPUUtils.load_binary = lambda self, *args: (None, None, 0, 0, 0)
+        _orig_launcher_call = XPULauncher.__call__
+        def _noop_launcher(self, *args):
+            print("[compile_only] DEBUG: XPULauncher.__call__ intercepted (no-op)")
+        XPULauncher.__call__ = _noop_launcher
+
+        _orig_load_binary = XPUUtils.load_binary
+        def _noop_load_binary(self, *args):
+            print("[compile_only] DEBUG: XPUUtils.load_binary intercepted (no-op)")
+            return (None, None, 0, 0, 0)
+        XPUUtils.load_binary = _noop_load_binary
 
         # Patch assert_close to skip verification — cross-compiled kernels
         # can't run on the native device anyway.
         _bm.assert_close = lambda *a, **kw: None
 
+        # DEBUG: wrap subprocess.check_output to trace ocloc calls and
+        # check which libocloc.so is loaded.
+        import subprocess as _sp
+        _orig_check_output = _sp.check_output
+        def _debug_check_output(cmd, **kwargs):
+            if isinstance(cmd, list) and cmd and "ocloc" in str(cmd[0]):
+                print(f"[compile_only] DEBUG ocloc cmd: {' '.join(cmd[:10])}...")
+                # Check which libocloc.so ocloc will load
+                import subprocess as _sp2
+                ldd = _sp2.run(["ldd", cmd[0]], capture_output=True, text=True)
+                for line in ldd.stdout.splitlines():
+                    if "ocloc" in line or "igc" in line:
+                        print(f"[compile_only] DEBUG ldd: {line.strip()}")
+                # Report LD_LIBRARY_PATH (first 200 chars)
+                ldp = os.environ.get("LD_LIBRARY_PATH", "")
+                print(f"[compile_only] DEBUG LD_LIBRARY_PATH: {ldp[:200]}...")
+                # Also report IGC_DumpToCustomDir
+                print(f"[compile_only] DEBUG IGC_DumpToCustomDir={os.environ.get('IGC_DumpToCustomDir', 'NOT SET')}")
+                print(f"[compile_only] DEBUG IGC_ShaderDumpEnable={os.environ.get('IGC_ShaderDumpEnable', 'NOT SET')}")
+            return _orig_check_output(cmd, **kwargs)
+        _sp.check_output = _debug_check_output
+
         print("[compile_only] Cross-compile mode: patched XPULauncher + load_binary "
-              "(no GPU dispatch)")
+              "(no GPU dispatch) + ocloc debug tracing")
 
     # Use a tiny non-zero time (1e-3 ms) to avoid division-by-zero in
     # benchmark functions that compute GB/s = bytes / (ms * 1e-3).
@@ -397,6 +427,17 @@ def _patch_compile_only():
                 fn()
             except Exception as e:
                 print(f"[compile_only] Execution error (may be expected): {e}")
+            # DEBUG: check .platform in dump files after fn()
+            if _cross_compile:
+                import glob as _glob
+                dump_dir = os.environ.get("IGC_DumpToCustomDir", "")
+                if dump_dir:
+                    for asm in _glob.glob(os.path.join(dump_dir, "*.asm")):
+                        with open(asm) as _f:
+                            for line in _f:
+                                if ".platform" in line:
+                                    print(f"[compile_only] DEBUG dump platform: {os.path.basename(asm)}: {line.strip()}")
+                                    break
             if quantiles is not None:
                 # quantile values + mean + cv
                 return [_DUMMY_MS] * len(quantiles) + [_DUMMY_MS, 0.0]
