@@ -375,19 +375,28 @@ def _patch_compile_only():
         # afterwards for the L0 native-device path — skip them entirely.
         # With load_binary patched out, L0's IGC is never invoked, so
         # IGC_ShaderDumpEnable can stay set (no native dumps to overwrite).
-        from triton.backends.intel.driver import XPULauncher, XPUUtilsSharedLibrary
+        from triton.backends.intel.driver import XPULauncher
         def _noop_launcher(self, *args):
             print("[compile_only] DEBUG: XPULauncher.__call__ intercepted (no-op)")
         XPULauncher.__call__ = _noop_launcher
 
-        # Patch load_binary on XPUUtilsSharedLibrary (the class that owns it).
-        # Cannot access driver.active.utils here — it triggers L0 device init
-        # which segfaults with ProductFamilyOverride=cri on non-CRI hardware.
-        _orig_load_binary = XPUUtilsSharedLibrary.load_binary
-        def _noop_load_binary(self, *args):
-            print("[compile_only] DEBUG: load_binary intercepted (no-op)")
-            return (None, None, 0, 0, 0)
-        XPUUtilsSharedLibrary.load_binary = _noop_load_binary
+        # Patch _init_handles on CompiledKernel to skip L0 module creation.
+        # Cannot patch load_binary directly — it's set on the XPUUtils
+        # instance, and instantiating XPUUtils triggers L0 device init which
+        # segfaults with ProductFamilyOverride=cri on non-CRI hardware.
+        # _init_handles is called when the kernel is first launched; it calls
+        # load_binary and checks shared memory limits.  Replace it entirely.
+        from triton.compiler.compiler import CompiledKernel
+        def _noop_init_handles(self):
+            if self.module is not None:
+                return
+            print("[compile_only] DEBUG: _init_handles intercepted (no L0 module creation)")
+            self.module = "dummy"
+            self.function = None
+            self.n_regs = 0
+            self.n_spills = 0
+            self.n_max_threads = 0
+        CompiledKernel._init_handles = _noop_init_handles
 
         # Patch assert_close to skip verification — cross-compiled kernels
         # can't run on the native device anyway.
