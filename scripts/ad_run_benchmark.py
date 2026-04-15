@@ -194,6 +194,7 @@ def _mock_gpu_for_cross_compile():
     _mock_dev_props.total_memory = 128 * 1024**3  # 128 GB
     _mock_dev_props.max_work_group_size = 1024
     _mock_dev_props.name = f"Cross-compile ({arch})"
+    _mock_dev_props.gpu_subslice_count = 64  # used by flex_decoding.get_split_k()
 
     # Mock device capability dict (returned by torch.xpu.get_device_capability)
     _mock_dev_cap = {
@@ -391,6 +392,32 @@ def _mock_gpu_for_cross_compile():
 
         _lowerings[_flex_hop] = _xpu_flex_lower
 
+    # Same override for the backward lowering.
+    _flex_bwd_hop = torch.ops.higher_order.flex_attention_backward
+    if _flex_bwd_hop in _lowerings:
+        _orig_flex_bwd_lower = _lowerings[_flex_bwd_hop]
+
+        def _xpu_flex_bwd_lower(*args, **kwargs):
+            query = args[0]
+            _saved = query.get_device
+            query.get_device = lambda: torch.device("xpu:0")
+            try:
+                return _orig_flex_bwd_lower(*args, **kwargs)
+            finally:
+                query.get_device = _saved
+
+        _lowerings[_flex_bwd_hop] = _xpu_flex_bwd_lower
+
+    # Patch _validate_device in flex_attention eager module. This function
+    # raises "FlexAttention does not support backward on CPU" when tensors
+    # have requires_grad=True on CPU. It runs before torch.compile, so it
+    # can't be caught by the compile_only stub.
+    try:
+        import torch.nn.attention.flex_attention as _flex_eager_mod
+        _flex_eager_mod._validate_device = lambda *a, **kw: None
+    except (ImportError, AttributeError):
+        pass
+
     # Redirect _empty_strided_xpu to CPU — the generated TorchInductor
     # wrapper uses this C function to allocate output tensors on XPU.
     # Without override, it segfaults (no SYCL device).
@@ -580,7 +607,21 @@ def _force_autotune_config(module):
         if isinstance(obj, Autotuner):
             matching = [c for c in obj.configs if _match(c)]
             if matching:
-                obj.configs = matching[:1]
+                matched = matching[0]
+                # Build a new config with ONLY the specified kwargs, using
+                # values from the matched config to preserve types (e.g.
+                # grf_mode must stay a string '256', not int 256).
+                # This avoids extra kwargs in the matched config (like N_CTX
+                # in flash attention) that would conflict with benchmark args.
+                filtered_kwargs = {k: matched.kwargs.get(k, v) for k, v in kwargs.items()}
+                # Merge top-level params: specified override > matched value
+                merged_top = {}
+                for k in top_level_keys:
+                    if k in top_level:
+                        merged_top[k] = top_level[k]
+                    elif hasattr(matched, k) and getattr(matched, k) is not None:
+                        merged_top[k] = getattr(matched, k)
+                obj.configs = [triton.Config(filtered_kwargs, **merged_top)]
             else:
                 # Create a new Config with the specified params
                 new_cfg = triton.Config(kwargs, **top_level)
@@ -771,7 +812,18 @@ def main():
         _patch_compile_only()
 
     # 11. Run the benchmark
-    mark.run(show_plots=False, print_data=True)
+    # In compile_only mode, some benchmarks (e.g. flex_bwd) call the compiled
+    # function eagerly outside do_bench to compute reference outputs. Those
+    # calls are not covered by the do_bench stub, so exceptions propagate and
+    # crash the process. Catch them here so the run exits cleanly.
+    if os.environ.get("AD_COMPILE_ONLY") == "1":
+        try:
+            mark.run(show_plots=False, print_data=True)
+        except Exception as e:
+            print(f"[compile_only] Benchmark runner error (expected in compile-only mode): "
+                  f"{type(e).__name__}: {e}")
+    else:
+        mark.run(show_plots=False, print_data=True)
 
 
 if __name__ == "__main__":
