@@ -223,6 +223,14 @@ def _mock_gpu_for_cross_compile():
     torch.xpu.current_stream = lambda *a, **kw: _mock_stream
     torch.xpu.Event = lambda *a, **kw: _mock_event
 
+    # Prevent _lazy_init from calling torch._C._xpu_init() — it raises
+    # "No XPU devices are available" in contexts like preserve_rng_state.
+    torch.xpu._lazy_init = lambda: None
+    torch.xpu.get_rng_state = lambda *a, **kw: torch.empty(0, dtype=torch.uint8)
+    torch.xpu.set_rng_state = lambda *a, **kw: None
+    torch.xpu.manual_seed = lambda *a, **kw: None
+    torch.xpu.manual_seed_all = lambda *a, **kw: None
+
     print("[mock_gpu] Layer 1: torch.xpu functions mocked")
 
     # ---- Layer 2: Triton XPUDriver mocks ----
@@ -312,6 +320,99 @@ def _mock_gpu_for_cross_compile():
     torch.Tensor.xpu = lambda self, *a, **kw: self
 
     print("[mock_gpu] Layer 3: tensor factories redirect xpu → cpu")
+
+    # ---- Layer 4: torch.compile + TorchInductor (FlexAttention) support ----
+    #
+    # FlexAttention uses torch.compile → TorchDynamo → TorchInductor → Triton.
+    # Three problems arise on a GPU-less machine:
+    #
+    # Problem A: TorchDynamo's SymbolicStreamState.__init__ calls
+    #   torch.accelerator.current_stream() → torch._C._accelerator_getDeviceIndex()
+    #   → fails with "RuntimeError: No XPU devices are available."
+    #
+    # Problem B: Input tensors are on CPU (Layer 3 redirects xpu→cpu).
+    #   TorchInductor selects backend by device type: CPU → C++ codegen.
+    #   We need Triton codegen to trigger ocloc compilation and produce dumps.
+    #
+    # Problem C: FlexAttention's lowering has its own CPU check:
+    #   `if query.get_device().type == "cpu": return lower_cpu(...)`
+    #   which fails because check_cpu_supported() returns False when
+    #   torch.xpu.is_available() is True (our Layer 1 mock).
+    #   Even with cpu_backend="triton", FlexAttention never reaches the
+    #   Triton template path for CPU device.
+    #
+    # Fix A: Mock torch.accelerator functions.
+    # Fix B: Set torch._inductor.config.cpu_backend = "triton".
+    # Fix C: Override FlexAttention lowering to skip CPU device check.
+    #   Also redirect _empty_strided_xpu to CPU so the generated wrapper
+    #   code can allocate output tensors without a real XPU device.
+
+    # Fix A: torch.accelerator mocks
+    import torch.accelerator
+
+    class _MockAccelStream:
+        """Minimal stream mock for torch.accelerator."""
+        device = torch.device("cpu")
+        sycl_queue = 0
+
+    _accel_stream = _MockAccelStream()
+    torch.accelerator.is_available = lambda: True
+    torch.accelerator.current_device_index = lambda: 0
+    torch.accelerator.device_count = lambda: 1
+    torch.accelerator.current_stream = lambda *a, **kw: _accel_stream
+    torch.accelerator.set_stream = lambda *a, **kw: None
+
+    # Fix B: Force Triton backend for CPU
+    import torch._inductor.config
+    torch._inductor.config.cpu_backend = "triton"
+
+    # Fix C: Override FlexAttention lowering to use Triton (GPU) path
+    # The lowering checks query.get_device().type == "cpu" and routes to
+    # lower_cpu() which fails. We override query.get_device() to return
+    # xpu:0 so it enters the Triton template path instead. The generated
+    # Triton kernels are compiled by ocloc for the target arch (CRI).
+    from torch._inductor.lowering import lowerings as _lowerings
+    _flex_hop = torch.ops.higher_order.flex_attention
+    if _flex_hop in _lowerings:
+        _orig_flex_lower = _lowerings[_flex_hop]
+
+        def _xpu_flex_lower(query, key, value, subgraph, block_mask, scale,
+                            kernel_options, score_mod_other_buffers,
+                            mask_mod_other_buffers):
+            _saved = query.get_device
+            query.get_device = lambda: torch.device("xpu:0")
+            try:
+                return _orig_flex_lower(
+                    query, key, value, subgraph, block_mask, scale,
+                    kernel_options, score_mod_other_buffers,
+                    mask_mod_other_buffers)
+            finally:
+                query.get_device = _saved
+
+        _lowerings[_flex_hop] = _xpu_flex_lower
+
+    # Redirect _empty_strided_xpu to CPU — the generated TorchInductor
+    # wrapper uses this C function to allocate output tensors on XPU.
+    # Without override, it segfaults (no SYCL device).
+    torch._C._dynamo.guards._empty_strided_xpu = (
+        lambda size, stride, dtype: torch.empty_strided(size, stride, dtype=dtype)
+    )
+
+    # Override Triton compilation target: TorchInductor creates a
+    # GPUTarget('cpu', ...) for CPU tensors. No Triton CPU backend
+    # exists, so compilation fails. We redirect to the mocked XPU
+    # target (CRI) so the Intel Triton backend + ocloc is used.
+    import triton
+    _orig_triton_compile = triton.compile
+
+    def _xpu_triton_compile(*args, **kwargs):
+        if "target" in kwargs and getattr(kwargs["target"], "backend", None) == "cpu":
+            kwargs["target"] = triton.runtime.driver.active.get_current_target()
+        return _orig_triton_compile(*args, **kwargs)
+
+    triton.compile = _xpu_triton_compile
+
+    print("[mock_gpu] Layer 4: torch.compile + FlexAttention cross-compile support")
 
 
 def _filter_triton_only(bench):
