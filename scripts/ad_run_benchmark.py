@@ -287,6 +287,7 @@ def _mock_gpu_for_cross_compile():
     _factory_names = (
         "randn", "zeros", "ones", "empty", "full", "rand", "arange",
         "tensor", "randn_like", "zeros_like", "ones_like", "empty_like",
+        "randint", "randint_like",
     )
     for fn_name in _factory_names:
         orig = getattr(torch, fn_name, None)
@@ -601,32 +602,65 @@ def _force_autotune_config(module):
                 return False
         return True
 
+    def _patch(obj):
+        matching = [c for c in obj.configs if _match(c)]
+        if matching:
+            matched = matching[0]
+            # Build a new config with ONLY the specified kwargs, using
+            # values from the matched config to preserve types (e.g.
+            # grf_mode must stay a string '256', not int 256).
+            # This avoids extra kwargs in the matched config (like N_CTX
+            # in flash attention) that would conflict with benchmark args.
+            filtered_kwargs = {k: matched.kwargs.get(k, v) for k, v in kwargs.items()}
+            # Merge top-level params: specified override > matched value
+            merged_top = {}
+            for k in top_level_keys:
+                if k in top_level:
+                    merged_top[k] = top_level[k]
+                elif hasattr(matched, k) and getattr(matched, k) is not None:
+                    merged_top[k] = getattr(matched, k)
+            obj.configs = [triton.Config(filtered_kwargs, **merged_top)]
+        else:
+            # Create a new Config with the specified params
+            new_cfg = triton.Config(kwargs, **top_level)
+            obj.configs = [new_cfg]
+
+    seen = set()
     patched = 0
+    # Module-level scan (handles @triton.autotune decorators).
     for attr_name in dir(module):
         obj = getattr(module, attr_name, None)
-        if isinstance(obj, Autotuner):
-            matching = [c for c in obj.configs if _match(c)]
-            if matching:
-                matched = matching[0]
-                # Build a new config with ONLY the specified kwargs, using
-                # values from the matched config to preserve types (e.g.
-                # grf_mode must stay a string '256', not int 256).
-                # This avoids extra kwargs in the matched config (like N_CTX
-                # in flash attention) that would conflict with benchmark args.
-                filtered_kwargs = {k: matched.kwargs.get(k, v) for k, v in kwargs.items()}
-                # Merge top-level params: specified override > matched value
-                merged_top = {}
-                for k in top_level_keys:
-                    if k in top_level:
-                        merged_top[k] = top_level[k]
-                    elif hasattr(matched, k) and getattr(matched, k) is not None:
-                        merged_top[k] = getattr(matched, k)
-                obj.configs = [triton.Config(filtered_kwargs, **merged_top)]
-            else:
-                # Create a new Config with the specified params
-                new_cfg = triton.Config(kwargs, **top_level)
-                obj.configs = [new_cfg]
+        if isinstance(obj, Autotuner) and id(obj) not in seen:
+            seen.add(id(obj))
+            _patch(obj)
             patched += 1
+        elif obj is not None and not isinstance(obj, Autotuner):
+            # Deep scan: look one level into classes/objects for nested
+            # Autotuners (e.g. flash_attention's _attention.tune_attn_fwd).
+            # Skip built-in / stdlib objects by only scanning objects whose
+            # module matches the benchmark module to avoid expensive dir()
+            # on third-party objects.
+            try:
+                obj_mod = getattr(obj, "__module__", None)
+            except Exception:
+                obj_mod = None
+            if obj_mod != module.__name__:
+                continue
+            try:
+                nested_names = dir(obj)
+            except Exception:
+                continue
+            for nested_name in nested_names:
+                if nested_name.startswith("__"):
+                    continue
+                try:
+                    nested = getattr(obj, nested_name, None)
+                except Exception:
+                    continue
+                if isinstance(nested, Autotuner) and id(nested) not in seen:
+                    seen.add(id(nested))
+                    _patch(nested)
+                    patched += 1
 
     if patched:
         print(f"[ad_run_benchmark] Forced autotune config on {patched} kernel(s): "
@@ -743,6 +777,66 @@ def _filter_masks(bench):
         bench.x_vals = filtered
 
 
+def _fixup_flash_attention_forward(module):
+    """Patch _attention.forward to match the current kernel signature.
+
+    The checked-in flash_attention_benchmark.py call site was never updated
+    after the kernel migrated to tensor descriptors (commit 5fee15d3c) —
+    it still passes 24 positional args + N_CTX kwarg, which matches the
+    old `_attn_fwd_with_block_pointers(Q, K, V, sm_scale, M, Out, strides...)`
+    signature but collides with the new `_attn_fwd(sm_scale, M, Z, H, Q, K, V, O,
+    N_CTX, ...)` signature (N_CTX ends up filled by q.stride(2) positionally
+    AND by the N_CTX kwarg → "multiple values for N_CTX").
+
+    We cannot edit the benchmark file (it ships via the pip package), so we
+    replace `_attention.forward` with a staticmethod that issues the correct
+    call for the default (non-advanced) path. This only touches the autotuned
+    forward path; the backward path (tune_attn_bwd) is unchanged.
+    """
+    if module.__name__ != "triton_kernels_benchmark.flash_attention_benchmark":
+        return
+    import torch
+    import triton
+    _attention_cls = getattr(module, "_attention", None)
+    if _attention_cls is None:
+        return
+
+    @staticmethod
+    def _patched_forward(ctx, q, k, v, causal, sm_scale):
+        Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
+        assert Lq == Lk and Lk == Lv
+        assert Lk in {16, 32, 64, 128}
+        o = torch.empty_like(q)
+        stage = 3 if causal else 1
+        grid = lambda args: (q.shape[0], q.shape[1], triton.cdiv(q.shape[2], args['BLOCK_M']))
+        n_ctx = q.shape[2]
+        if n_ctx <= 512:
+            grid = lambda args: (triton.cdiv(q.shape[2], args['BLOCK_M']), 1, q.shape[0] * q.shape[1])
+        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+
+        _attention_cls.tune_attn_fwd[grid](  # pylint: disable=unsubscriptable-object
+            sm_scale, M,
+            q.shape[0], q.shape[1],
+            q, k, v, o,
+            N_CTX=q.shape[2],
+            HEAD_DIM=Lk,
+            STAGE=stage,
+        )
+
+        ctx.save_for_backward(q, k, v, o, M)
+        ctx.sm_scale = sm_scale
+        ctx.HEAD_DIM = Lk
+        ctx.causal = causal
+        return o
+
+    _attention_cls.forward = _patched_forward
+    # _attention.apply is a torch.autograd.Function descriptor; reassign so
+    # the module-level `attention` alias picks up the new forward.
+    module.attention = _attention_cls.apply
+    print("[ad_run_benchmark] Patched flash_attention _attention.forward "
+          "to match current kernel signature")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -780,8 +874,15 @@ def main():
     # 4. Import the benchmark module and get the Mark object
     module = importlib.import_module(f"triton_kernels_benchmark.{spec['module']}")
 
-    # 5. Force specific autotune config if requested (before get_benchmark
-    #    which may trigger compilation)
+    # 5. Force specific autotune config if requested. Called twice:
+    #    - Before get_benchmark() for kernels whose Autotuner is created by
+    #      @triton.autotune at module import (most benchmarks).
+    #    - After get_benchmark() for kernels whose Autotuner is created
+    #      inside get_benchmark() (flash_attention assigns _attention.tune_attn_fwd
+    #      = tuner(attn_fwd) only when the factory runs).
+    #    _force_autotune_config is idempotent: once a config list is reduced
+    #    to one entry, the second pass re-matches and rewrites the same single
+    #    entry. Duplicate Autotuner instances are skipped via id() tracking.
     _force_autotune_config(module)
 
     if "factory" in spec:
@@ -789,6 +890,13 @@ def main():
         mark = getattr(module, spec["factory"])(**kwargs)
     else:
         mark = getattr(module, spec["attr"])
+
+    # Flash attention's checked-in _attention.forward uses an obsolete call
+    # pattern that does not match the current kernel; rewrite it before the
+    # benchmark runs so both native and cross-compile paths produce dumps.
+    _fixup_flash_attention_forward(module)
+
+    _force_autotune_config(module)
 
     bench = mark.benchmarks
 
