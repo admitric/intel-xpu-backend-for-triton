@@ -505,6 +505,57 @@ def _mock_gpu_for_cross_compile():
 
     triton.compile = _xpu_triton_compile
 
+    # Force tt.divisibility=16 on every tensor kernel arg. TorchInductor's
+    # is_aligned fails for flex_attention's Q/K/V because their offsets are
+    # symbolic (GQA head / batch slicing), so statically_known_multiple_of
+    # returns False and `divisible_by_16` omits them. Without that hint
+    # MaterializeBlockPointer rejects the load (axisInfo.getDivisibility %4
+    # check) and Triton falls back to scalar lsc_load — the kernels we want
+    # to inspect end up looking 10× larger than their real-GPU equivalents.
+    # Monkey-patch is_aligned so every TensorArg becomes divisible_by_16;
+    # the real driver enforces 16B-aligned allocations anyway, so this is a
+    # safe over-approximation for compile-only dumps.
+    try:
+        from torch._inductor.codegen import triton_utils as _ti
+        from torch._inductor.codegen.common import TensorArg
+        _orig_config_of = _ti.config_of
+
+        def _config_of_force_aligned(args, *, indices=None, **kwargs):
+            if indices is None:
+                indices = list(range(len(args)))
+            original = _orig_config_of(args, indices=indices, **kwargs)
+            # Triton-2025 AttrsDescriptorWrapper returns a plain dict
+            # {(i,): [['tt.divisibility', 16], ...], ...}. Merge in every
+            # TensorArg index so flex_attention's Q/K/V get the hint.
+            if not isinstance(original, dict):
+                return original
+            merged = dict(original)
+            for i, a in zip(indices, args):
+                if isinstance(a, TensorArg) and (i,) not in merged:
+                    merged[(i,)] = [["tt.divisibility", 16]]
+            return merged
+
+        # Patch the function at its definition site AND every module that
+        # did `from .triton_utils import config_of`, since those bound the
+        # original reference at import time. select_algorithm.py is the
+        # critical one for templates (flex_attention, gemm).
+        _ti.config_of = _config_of_force_aligned
+        for _mod_name in (
+            "torch._inductor.codegen.triton",
+            "torch._inductor.codegen.wrapper",
+            "torch._inductor.codegen.triton_combo_kernel",
+            "torch._inductor.select_algorithm",
+        ):
+            try:
+                import importlib
+                _mod = importlib.import_module(_mod_name)
+                if hasattr(_mod, "config_of"):
+                    _mod.config_of = _config_of_force_aligned
+            except ImportError:
+                pass
+    except (ImportError, AttributeError):
+        pass
+
     print("[mock_gpu] Layer 4: torch.compile + FlexAttention cross-compile support")
 
 

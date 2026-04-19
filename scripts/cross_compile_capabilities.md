@@ -127,3 +127,34 @@ To catch capability drift early:
 - `configs/sanity_cross_compile_cri.yaml` runs a small set of representative kernels.
 - After the run, grep each `dumps/*_codegen.ll` for `LSC2DBlockRead`/`sub_group_dpas` counts.
 - On a healthy run, flex_fwd / gemm / gemm_bt kernels should show **> 0** `LSC2DBlockRead` and non-zero DPAS equivalents (via the vectorizer-driven path). If any of them shows 0, capability flags are probably wrong or a recently-added one is missing from the mock.
+
+## Known TorchInductor workaround: Q/K/V divisibility for flex_attention
+
+Current torch (≥2025) has a bug in `torch._inductor.codegen.triton_utils.config_of →
+is_aligned`: for graph inputs whose offset is symbolic (e.g. flex_attention's
+Q/K/V sliced by GQA head / batch), `statically_known_multiple_of` returns
+False, so those pointer args never get the `tt.divisibility = 16` hint.
+
+Without that hint, `MaterializeBlockPointer::isMajor` fails the
+`axisInfo.getDivisibility(fastChangeDim) % 4 != 0` gate and the load is left
+as a plain scalar `lsc_load` instead of an `lsc_load_block2d`. On flex
+kernels this turns into ~800× more scalar loads and no 2D block reads at
+all. Symptom to look for: `codegen.ll` has `LSC2DBlockWrite > 0` but
+`LSC2DBlockRead == 0` (reads lost, writes kept).
+
+The mock's Layer 4 monkey-patches `config_of` across all modules that
+imported it (triton_utils, triton, wrapper, triton_combo_kernel,
+select_algorithm) so every `TensorArg` gets the hint. The underlying
+allocation from a real driver is always 16B-aligned, so this is a safe
+over-approximation for compile-only dumps.
+
+If you ever need to verify the patch is live:
+```bash
+AD_MOCK_GPU=1 TRITON_INTEL_DEVICE_ARCH=bmg TRITON_KERNEL_DUMP=1 \
+  TRITON_DUMP_DIR=/tmp/_dump python scripts/ad_run_benchmark.py flex_attn_causal_fwd
+grep 'tt.func' /tmp/_dump/*/*.ttgir | head -1
+```
+You should see `{tt.divisibility = 16 : i32}` on arg_Q, arg_K, arg_V. If
+those annotations are missing, the monkey-patch didn't run (check for an
+`ImportError` in the mock's `try/except`, e.g. a class moved in a torch
+upgrade — in that case update the import site in `ad_run_benchmark.py`).
