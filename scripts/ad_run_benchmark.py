@@ -165,6 +165,65 @@ def _mock_native_modules():
             sys.modules[mod_name] = types.ModuleType(mod_name)
 
 
+# Per-arch has_* capability defaults for the cross-compile mock.
+#
+# Without these, compiler.py's tgt_prop.get('has_2d_block_io', False) etc. all
+# default False, so MaterializeBlockPointer / Pipeline / AccelerateMatmul are
+# skipped and Triton emits scalar SPIR-V loads + scalar FMAs. See
+# cross_compile_capabilities.md for how to verify these match what a real
+# driver reports on each arch.
+_ARCH_CAPABILITIES = {
+    # Xe2 family (Battlemage)
+    "bmg": {
+        "has_2d_block_io": True,
+        "has_subgroup_matrix_multiply_accumulate": True,
+        "has_bfloat16_conversion": True,
+        "has_bfloat16_arithmetic": True,
+        "has_predicated_io": True,
+        "has_16bit_atomics": True,
+        "has_fp64": True,
+    },
+    # Xe1 HPC (Ponte Vecchio). Note: TF32 MMA is False on PVC 1100 (test_driver.py).
+    "pvc": {
+        "has_2d_block_io": True,
+        "has_subgroup_matrix_multiply_accumulate": True,
+        "has_bfloat16_conversion": True,
+        "has_bfloat16_arithmetic": True,
+        "has_16bit_atomics": True,
+        "has_fp64": True,
+    },
+    # Xe3P family (CRI). Adds BF8 DPAS and (on some configs) scaled MMA / F4.
+    "cri": {
+        "has_2d_block_io": True,
+        "has_subgroup_matrix_multiply_accumulate": True,
+        "has_subgroup_matrix_multiply_accumulate_bfloat8": True,
+        "has_bfloat16_conversion": True,
+        "has_bfloat16_arithmetic": True,
+        "has_predicated_io": True,
+        "has_16bit_atomics": True,
+        "has_fp64": True,
+        "has_256b_prefetch": True,
+    },
+    # Xe3 (Panther Lake) share Xe3P fast-path capabilities.
+    "ptl_h": {
+        "has_2d_block_io": True,
+        "has_subgroup_matrix_multiply_accumulate": True,
+        "has_bfloat16_conversion": True,
+        "has_bfloat16_arithmetic": True,
+        "has_predicated_io": True,
+        "has_16bit_atomics": True,
+    },
+    "ptl_u": {
+        "has_2d_block_io": True,
+        "has_subgroup_matrix_multiply_accumulate": True,
+        "has_bfloat16_conversion": True,
+        "has_bfloat16_arithmetic": True,
+        "has_predicated_io": True,
+        "has_16bit_atomics": True,
+    },
+}
+
+
 def _mock_gpu_for_cross_compile():
     """Mock GPU subsystem for cross-compilation on machines without an Intel GPU.
 
@@ -244,6 +303,12 @@ def _mock_gpu_for_cross_compile():
     target_props = dict(_mock_dev_cap)
     target_props["arch"] = arch
     target_props["__intel_already_queried_extensions__"] = True
+    # Seed has_* capability flags from the per-arch table; env var adds more.
+    # Without these, compiler.py's tgt_prop.get('has_*', False) returns False
+    # for every capability and Triton falls back to scalar loads + scalar FMAs.
+    arch_caps = _ARCH_CAPABILITIES.get(arch, {})
+    for cap, enabled in arch_caps.items():
+        target_props[cap] = enabled
     if extensions_str:
         for ext in extensions_str.split():
             target_props[ext] = True
