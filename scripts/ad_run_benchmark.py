@@ -975,6 +975,63 @@ def _fixup_flash_attention_forward(module):
           "to match current kernel signature")
 
 
+def _fixup_flex_sdpa_reference(module):
+    """Skip the sycl-tla SDPA reference comparison in cross-compile mode.
+
+    flex_attention_benchmark_causal_mask.benchmark() runs an SDPA reference
+    (via F.scaled_dot_product_attention under sdpa_kernel(FLASH_ATTENTION))
+    before the Triton kernel whenever D_HEAD_qk == D_HEAD_v, so it can
+    assert_close triton vs sycl-tla. With AD_MOCK_GPU=1 there is no XPU
+    device, so the reference dispatch routes to FlashAttentionXPU which
+    raises 'XPU device is not available' — aborting the x_vals loop in
+    Mark._run before the Triton kernel is ever compiled. Result: zero IGC
+    dumps for the 96 decode/append flex_bwd configs (shapes where
+    D_HEAD_qk == D_HEAD_v).
+
+    Replace get_sdpa_benchmark with a stub that:
+    - Returns None for the fwd path — the benchmark already handles
+      `if sycl_fn is not None: assert_close(...)`.
+    - Returns a grad-connected fake (bwd_fn, do, o) tuple for the bwd path
+      so the downstream `_, _, sycl_o = sdpa_result` unpack and
+      `torch.autograd.grad((sycl_o,), (q, k, v), ...)` call succeed
+      without touching FlashAttentionXPU. assert_close is already patched
+      to a no-op by _patch_compile_only, so the fake tensor values are
+      irrelevant — only the grad graph shape needs to be valid.
+    """
+    if os.environ.get("AD_MOCK_GPU") != "1":
+        return
+    if not module.__name__.startswith("triton_kernels_benchmark.flex_attention_benchmark"):
+        return
+    if not hasattr(module, "get_sdpa_benchmark"):
+        return
+
+    import torch
+
+    def _fake_sdpa(q, k, v, attn_bias, use_causal, sm_scale, H_q, H_kv,
+                   D_HEAD_qk, D_HEAD_v, MODE, provider, backwards_grad=None):
+        # Preserve the original early-return so D_HEAD_qk != D_HEAD_v still
+        # takes the "reference not available" branch.
+        if D_HEAD_qk != D_HEAD_v or (provider == 'onednn' and MODE == 'bwd'):
+            return None
+        if MODE != 'bwd':
+            # fwd path just needs a callable; assert_close is a no-op and
+            # the lambda is not invoked in cross-compile mode.
+            return lambda: q.sum() + k.sum() + v.sum()
+        # bwd path: need (bwd_fn, do, sycl_o) where sycl_o has grad
+        # connectivity to (q, k, v) so torch.autograd.grad succeeds.
+        Z, N_q = q.shape[0], q.shape[2]
+        scalar = q.sum() + k.sum() + v.sum()
+        fake_o = scalar * torch.ones(
+            (Z, H_q, N_q, D_HEAD_v), device=q.device, dtype=q.dtype)
+        do = backwards_grad if backwards_grad is not None else torch.randn_like(fake_o)
+        bwd_fn = lambda: fake_o.backward(do, retain_graph=True)
+        return bwd_fn, do, fake_o
+
+    module.get_sdpa_benchmark = _fake_sdpa
+    print("[ad_run_benchmark] Patched flex_attention get_sdpa_benchmark "
+          "to skip SDPA reference in cross-compile mode")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1033,6 +1090,10 @@ def main():
     # pattern that does not match the current kernel; rewrite it before the
     # benchmark runs so both native and cross-compile paths produce dumps.
     _fixup_flash_attention_forward(module)
+
+    # Skip sycl-tla SDPA reference when mocking the GPU — otherwise flex_bwd
+    # decode/append shapes abort before Triton codegen runs.
+    _fixup_flex_sdpa_reference(module)
 
     _force_autotune_config(module)
 
