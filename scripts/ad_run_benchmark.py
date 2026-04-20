@@ -703,9 +703,9 @@ def _force_autotune_config(module):
               "skipping config override")
         return
 
-    def _match(cfg):
+    def _match(cfg, effective_kwargs):
         """Check if a Config matches the specification."""
-        for k, v in kwargs.items():
+        for k, v in effective_kwargs.items():
             cfg_val = cfg.kwargs.get(k)
             if cfg_val is None:
                 return False
@@ -719,7 +719,22 @@ def _force_autotune_config(module):
         return True
 
     def _patch(obj):
-        matching = [c for c in obj.configs if _match(c)]
+        # A benchmark module can expose multiple Autotuners with different
+        # kwarg schemas (e.g. flash_attention: _attn_fwd uses BLOCK_M/BLOCK_N
+        # while _attn_bwd uses BLOCK_M1/BLOCK_N1/BLOCK_M2/BLOCK_N2). Only
+        # force a single Config when the user kwargs fully cover THIS
+        # Autotuner's schema; otherwise the forced Config would either
+        # drop required kernel kwargs or inject kwargs with the wrong name
+        # for the kernel, triggering `dynamic_func() missing ... required
+        # positional arguments` at launch.
+        existing_keys = set()
+        for c in obj.configs:
+            existing_keys.update(c.kwargs.keys())
+        if existing_keys and not existing_keys.issubset(kwargs.keys()):
+            return False
+        effective_kwargs = {k: v for k, v in kwargs.items() if k in existing_keys}
+
+        matching = [c for c in obj.configs if _match(c, effective_kwargs)]
         if matching:
             matched = matching[0]
             # Build a new config with ONLY the specified kwargs, using
@@ -727,7 +742,7 @@ def _force_autotune_config(module):
             # grf_mode must stay a string '256', not int 256).
             # This avoids extra kwargs in the matched config (like N_CTX
             # in flash attention) that would conflict with benchmark args.
-            filtered_kwargs = {k: matched.kwargs.get(k, v) for k, v in kwargs.items()}
+            filtered_kwargs = {k: matched.kwargs.get(k, v) for k, v in effective_kwargs.items()}
             # Merge top-level params: specified override > matched value
             merged_top = {}
             for k in top_level_keys:
@@ -738,18 +753,22 @@ def _force_autotune_config(module):
             obj.configs = [triton.Config(filtered_kwargs, **merged_top)]
         else:
             # Create a new Config with the specified params
-            new_cfg = triton.Config(kwargs, **top_level)
+            new_cfg = triton.Config(effective_kwargs, **top_level)
             obj.configs = [new_cfg]
+        return True
 
     seen = set()
     patched = 0
+    skipped = 0
     # Module-level scan (handles @triton.autotune decorators).
     for attr_name in dir(module):
         obj = getattr(module, attr_name, None)
         if isinstance(obj, Autotuner) and id(obj) not in seen:
             seen.add(id(obj))
-            _patch(obj)
-            patched += 1
+            if _patch(obj):
+                patched += 1
+            else:
+                skipped += 1
         elif obj is not None and not isinstance(obj, Autotuner):
             # Deep scan: look one level into classes/objects for nested
             # Autotuners (e.g. flash_attention's _attention.tune_attn_fwd).
@@ -775,11 +794,14 @@ def _force_autotune_config(module):
                     continue
                 if isinstance(nested, Autotuner) and id(nested) not in seen:
                     seen.add(id(nested))
-                    _patch(nested)
-                    patched += 1
+                    if _patch(nested):
+                        patched += 1
+                    else:
+                        skipped += 1
 
-    if patched:
-        print(f"[ad_run_benchmark] Forced autotune config on {patched} kernel(s): "
+    if patched or skipped:
+        skipped_note = f", skipped {skipped} (schema mismatch)" if skipped else ""
+        print(f"[ad_run_benchmark] Forced autotune config on {patched} kernel(s){skipped_note}: "
               f"kwargs={kwargs}, {top_level}")
     else:
         print("[ad_run_benchmark] WARNING: No Autotuner objects found in module")
