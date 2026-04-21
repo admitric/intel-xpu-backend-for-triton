@@ -686,7 +686,12 @@ def _apply_flex_overrides():
         try:
             from torch._inductor.template_heuristics.triton import FlexBwDConfig
             bwd_configs = eval(bwd_str)  # noqa: S307
-            flex_attn.V.choices.get_flex_attn_bwd_configs = lambda *a, **kw: bwd_configs
+            # Method name on V.choices is get_flex_attention_bwd_configs (the
+            # public one in choices.py); get_flex_attn_bwd_configs is only on
+            # the flex_heuristics class underneath. Patching the wrong name
+            # silently no-ops — the full default config list runs and six
+            # template candidates get compiled instead of one forced choice.
+            flex_attn.V.choices.get_flex_attention_bwd_configs = lambda *a, **kw: bwd_configs
         except ImportError:
             print("[ad_run_benchmark] WARNING: Could not import FlexBwDConfig; skipping bwd config override")
 
