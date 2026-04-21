@@ -481,6 +481,22 @@ def _mock_gpu_for_cross_compile():
     try:
         import torch.nn.attention.flex_attention as _flex_eager_mod
         _flex_eager_mod._validate_device = lambda *a, **kw: None
+
+        # Force OUTPUT_LOGSUMEXP=True on the mock path. _apply_kernel_options
+        # reads query.device.type directly and hardcodes OUTPUT_LOGSUMEXP=False
+        # when any input is on CPU (CPU flex path can't return LSE). The mock
+        # puts Q/K/V on CPU, so without this override the cross-compile kernel
+        # diverges from real XPU by ~30% instCount / 19x fewer branches.
+        _orig_apply_ko = _flex_eager_mod._apply_kernel_options
+
+        def _xpu_apply_ko(query, key, value, return_lse, kernel_options, return_aux=None):
+            result = _orig_apply_ko(query, key, value, return_lse, kernel_options, return_aux)
+            if (query.device.type == "cpu" or key.device.type == "cpu"
+                    or value.device.type == "cpu"):
+                result["OUTPUT_LOGSUMEXP"] = True
+            return result
+
+        _flex_eager_mod._apply_kernel_options = _xpu_apply_ko
     except (ImportError, AttributeError):
         pass
 
