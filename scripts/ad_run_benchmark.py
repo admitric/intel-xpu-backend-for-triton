@@ -309,6 +309,13 @@ def _mock_gpu_for_cross_compile():
     arch_caps = _ARCH_CAPABILITIES.get(arch, {})
     for cap, enabled in arch_caps.items():
         target_props[cap] = enabled
+    # Report a post-LTS driver_version so XPUBackend.is_lts() returns False.
+    # is_lts(None) is True → Triton annotates ttig.is_lts, which routes 2D
+    # block ops through GenISA intrinsics instead of __spirv_Subgroup2DBlock*
+    # builtins. Real BMG / CRI ship non-LTS drivers, so without this the mock
+    # emits a different SPV (and, for int8 stores, different IGC ASM) than
+    # real HW. Threshold is (1, 6, 35096, 9) in backend/compiler.py:is_lts().
+    target_props.setdefault("driver_version", "1.6.99999.9")
     if extensions_str:
         for ext in extensions_str.split():
             target_props[ext] = True
