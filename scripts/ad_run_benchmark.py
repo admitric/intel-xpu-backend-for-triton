@@ -556,6 +556,30 @@ def _mock_gpu_for_cross_compile():
     except (ImportError, AttributeError):
         pass
 
+    # Force can_use_tma()=True so flex_attention emits the TMA template branch.
+    # can_use_tma's _is_tma_compatible_matrix rejects a buffer when its name is
+    # in V.graph.unaligned_buffers. Layer 3 redirects flex inputs to CPU via
+    # torch.empty_strided; the CPU allocator's alignment guarantees don't meet
+    # Inductor's TMA rules, so all three Q/K/V inputs land in unaligned_buffers
+    # and can_use_tma returns False. flex_attention.py then flips USE_TMA to
+    # False and the jinja template emits scalar-pointer loads (tl.load) in
+    # place of tl.make_tensor_descriptor + descriptor_load. Real XPU inputs
+    # are aligned and stay on the TMA path, so cross-compile ends up shipping
+    # a structurally different kernel to IGC — different kernel hash,
+    # different instCount, different load_block2d count. Override at the
+    # imported-name sites since flex_attention/flex_decoding bound the symbol
+    # at module load.
+    try:
+        import torch._inductor.utils as _iu
+        import torch._inductor.kernel.flex.flex_attention as _fa_mod
+        import torch._inductor.kernel.flex.flex_decoding as _fd_mod
+        _always_true_tma = lambda *a, **kw: True
+        _iu.can_use_tma = _always_true_tma
+        _fa_mod.can_use_tma = _always_true_tma
+        _fd_mod.can_use_tma = _always_true_tma
+    except (ImportError, AttributeError):
+        pass
+
     print("[mock_gpu] Layer 4: torch.compile + FlexAttention cross-compile support")
 
 
