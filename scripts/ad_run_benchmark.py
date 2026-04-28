@@ -936,6 +936,106 @@ def _patch_compile_only():
     print(f"[compile_only] Patched do_bench — kernels will compile but not benchmark ({mode})")
 
 
+def _patch_do_bench_profiler_sync():
+    """Fix the missing synchronize() inside record_function in
+    do_bench_upstream_pytorch_profiler.
+
+    Upstream do_bench_upstream_pytorch_profiler exits each iteration's
+    record_function block immediately after fn() dispatches the kernel
+    (kernel still executing async). The PyTorch XPU profiler then truncates
+    each kernel event's duration to roughly the CPU dispatch time
+    (~270us); only the LAST iteration gets a correct duration because the
+    trailing synchronize() after the loop forces it to settle. Net effect:
+    median TFlops reported as 4000+ instead of ~90 on BMG/PVC GEMMs.
+
+    Fix (already on origin/mdziado/profiler_sync, commit 917c4366b "Add sync"):
+    move synchronize() INSIDE the record_function so each kernel completes
+    before its parent CPU event ends. With the fix, all iterations report
+    correct ~12ms durations.
+
+    Applied here as a runtime monkey-patch so admitric/measurements branch
+    doesn't have to carry the upstream change.
+    """
+    if os.environ.get("AD_COMPILE_ONLY") == "1":
+        return  # compile-only stubs do_bench anyway
+    try:
+        import itertools, time
+        import triton_kernels_benchmark.benchmark_testing as _bt
+        from torch.profiler import profile, ProfilerActivity, record_function
+        import torch
+    except ImportError:
+        return
+
+    def _patched(fn, n_warmup=25, n_repeat=100, grad_to_none=None, quantiles=None,
+                 return_mode="mean", device="xpu", sync_submitting=True,
+                 time_warmup=True, benchmark_label=None, max_iters=1500):
+        assert return_mode in ["min", "max", "mean", "median"]
+        fn()
+        _bt.synchronize()
+        cache_size = 256 * 1024 * 1024
+        cache = torch.empty(int(cache_size // 4), dtype=torch.int, device=device)
+        if time_warmup:
+            warmup_time_s = n_warmup / 1000
+            assert sync_submitting
+            start = time.perf_counter()
+            i = 0
+            while i < max_iters and time.perf_counter() - start < warmup_time_s:
+                fn()
+                _bt.synchronize()
+                i += 1
+        else:
+            for _ in range(n_warmup):
+                fn()
+                if sync_submitting:
+                    _bt.synchronize()
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.XPU]) as prof:
+            for _ in range(n_repeat):
+                if grad_to_none is not None:
+                    for x in grad_to_none:
+                        x.grad = None
+                cache.zero_()
+                if sync_submitting:
+                    _bt.synchronize()
+                with record_function("__profile_kernel_of_func"):
+                    fn()
+                    if sync_submitting:
+                        _bt.synchronize()  # FIX: sync inside record_function
+            _bt.synchronize()
+
+        profiling_func_filter = filter(
+            lambda x: x.name.startswith("__profile_kernel_of_func"
+                                        if benchmark_label is None else benchmark_label),
+            prof.events())
+        functions = list(profiling_func_filter)
+
+        def extract_kernels(funcs):
+            kernels = []
+            kernels += list(itertools.chain.from_iterable(
+                map(lambda func: extract_kernels(func.cpu_children), funcs)))
+            kernels += list(itertools.chain.from_iterable([func.kernels for func in funcs]))
+            return kernels
+
+        kernels = [extract_kernels(func.cpu_children) for func in functions]
+        kernels = [k for k in kernels if k != []]
+        relax = os.getenv("TRITON_RELAX_PROFILING_CHECK", "0") == "1"
+        if not (len(kernels) >= n_repeat - 1 if relax else len(kernels) == n_repeat):
+            raise AssertionError(
+                f"the profiling number not match; {n_repeat=}, {kernels=}")
+        times = torch.tensor([sum((k.duration for k in ks)) * 1e-3 for ks in kernels],
+                             dtype=torch.float)
+        return _bt._summarize_statistics(times, quantiles, return_mode)
+
+    if _bt.BENCHMARKING_METHOD != "UPSTREAM_PYTORCH_PROFILER":
+        return  # only the profiler path needs this fix
+    _bt.do_bench_upstream_pytorch_profiler = _patched
+    _bt.do_bench = _patched
+    import triton_kernels_benchmark as _bm
+    _bm.do_bench = _patched
+    print("[ad_run_benchmark] Patched do_bench_upstream_pytorch_profiler with "
+          "synchronize() inside record_function (fix for upstream issue, "
+          "see commit 917c4366b on mdziado/profiler_sync)")
+
+
 def _filter_masks(bench):
     """Filter x_vals to only include specified mask types.
 
@@ -1169,6 +1269,12 @@ def main():
     # 10. Compile-only mode: replace do_bench with single-call stub
     if os.environ.get("AD_COMPILE_ONLY") == "1":
         _patch_compile_only()
+    else:
+        # Perf path: fix the upstream do_bench_upstream_pytorch_profiler bug
+        # where kernel durations are truncated when synchronize() is OUTSIDE
+        # the record_function block. Without this, every shape reports
+        # ~0.27ms regardless of size and TFlops are 30-50x over hardware peak.
+        _patch_do_bench_profiler_sync()
 
     # 11. Run the benchmark
     # In compile_only mode, some benchmarks (e.g. flex_bwd) call the compiled
