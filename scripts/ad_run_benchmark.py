@@ -648,6 +648,35 @@ def _override_x_vals(bench):
         bench.x_vals = [parsed]
 
 
+_FLEX_PATCH_COUNTERS: dict[str, int] = {}
+_FLEX_ATEXIT_REGISTERED = False
+
+
+def _make_counted_override(env_var_name, configs):
+    _FLEX_PATCH_COUNTERS[env_var_name] = 0
+
+    def cb(*args, **kwargs):  # noqa: ARG001 — signature dictated by inductor
+        _FLEX_PATCH_COUNTERS[env_var_name] += 1
+        return configs
+
+    return cb
+
+
+def _verify_flex_overrides_fired():
+    missed = [k for k, v in _FLEX_PATCH_COUNTERS.items() if v == 0]
+    if not missed:
+        return
+    sys.stderr.write(
+        "[ad_run_benchmark] FATAL: flex override env vars were set but the "
+        "patched callbacks were never invoked: " + ", ".join(missed) + ". "
+        "The kernel template likely routed past the patched V.choices method. "
+        "Check torch._inductor.kernel.flex.* dispatch and method names; "
+        "see plan section 2.B for the expected mapping.\n"
+    )
+    sys.stderr.flush()
+    os._exit(2)
+
+
 def _apply_flex_overrides():
     """Override FlexAttention inductor autotuner configs from env vars.
 
@@ -655,8 +684,11 @@ def _apply_flex_overrides():
         Empty string means use defaults (no override).
     AD_FLEX_DECODE_CONFIGS: Python literal evaluating to a list of FlexDecodeConfig.
     AD_BWD_OVERRIDE_CONFIGS: Python literal evaluating to a list of FlexBwDConfig.
+
+    On exit, fails the process with code 2 if any override env var was set
+    but the patched callback was never called (catches kernel-routing drift).
     """
-    override_str = os.environ.get("AD_OVERRIDE_CONFIGS")  # None if not set
+    override_str = os.environ.get("AD_OVERRIDE_CONFIGS")
     decode_str = os.environ.get("AD_FLEX_DECODE_CONFIGS")
     bwd_str = os.environ.get("AD_BWD_OVERRIDE_CONFIGS")
 
@@ -665,35 +697,47 @@ def _apply_flex_overrides():
 
     try:
         import torch._inductor.kernel.flex.flex_attention as flex_attn
-        from torch._inductor.template_heuristics.triton import FlexConfig
+        from torch._inductor.template_heuristics.triton import FlexConfig  # noqa: F401
     except ImportError:
         print("[ad_run_benchmark] WARNING: Could not import FlexConfig; skipping config override")
         return
 
     if override_str:
-        configs = eval(override_str)  # noqa: S307  — trusted input from YAML config
-        flex_attn.V.choices.get_flex_attention_fwd_configs = lambda *a, **kw: configs
+        configs = eval(override_str)  # noqa: S307 — trusted YAML
+        flex_attn.V.choices.get_flex_attention_fwd_configs = (
+            _make_counted_override("AD_OVERRIDE_CONFIGS", configs)
+        )
 
     if decode_str:
         try:
-            from torch._inductor.template_heuristics.triton import FlexDecodeConfig
+            from torch._inductor.template_heuristics.triton import FlexDecodeConfig  # noqa: F401
             decode_configs = eval(decode_str)  # noqa: S307
-            flex_attn.V.choices.get_flex_decode_configs = lambda *a, **kw: decode_configs
+            flex_attn.V.choices.get_flex_decode_configs = (
+                _make_counted_override("AD_FLEX_DECODE_CONFIGS", decode_configs)
+            )
         except ImportError:
             print("[ad_run_benchmark] WARNING: Could not import FlexDecodeConfig; skipping decode config override")
 
     if bwd_str:
         try:
-            from torch._inductor.template_heuristics.triton import FlexBwDConfig
+            from torch._inductor.template_heuristics.triton import FlexBwDConfig  # noqa: F401
             bwd_configs = eval(bwd_str)  # noqa: S307
             # Method name on V.choices is get_flex_attention_bwd_configs (the
             # public one in choices.py); get_flex_attn_bwd_configs is only on
             # the flex_heuristics class underneath. Patching the wrong name
             # silently no-ops — the full default config list runs and six
             # template candidates get compiled instead of one forced choice.
-            flex_attn.V.choices.get_flex_attention_bwd_configs = lambda *a, **kw: bwd_configs
+            flex_attn.V.choices.get_flex_attention_bwd_configs = (
+                _make_counted_override("AD_BWD_OVERRIDE_CONFIGS", bwd_configs)
+            )
         except ImportError:
             print("[ad_run_benchmark] WARNING: Could not import FlexBwDConfig; skipping bwd config override")
+
+    global _FLEX_ATEXIT_REGISTERED
+    if not _FLEX_ATEXIT_REGISTERED:
+        import atexit
+        atexit.register(_verify_flex_overrides_fired)
+        _FLEX_ATEXIT_REGISTERED = True
 
 
 def _coerce_value(v: str):
