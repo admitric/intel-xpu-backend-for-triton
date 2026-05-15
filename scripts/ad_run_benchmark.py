@@ -695,6 +695,24 @@ def _apply_flex_overrides():
     if override_str is None and decode_str is None and bwd_str is None:
         return
 
+    # Pre-register counters for every override env var that was set, before
+    # any import that could raise. This way an ImportError below leaves the
+    # counter at 0 and the atexit guard fires; if we instead registered
+    # inside the try block, an ImportError would skip registration entirely
+    # and the guard would see no missed counters (false-green pass).
+    if override_str:
+        _FLEX_PATCH_COUNTERS["AD_OVERRIDE_CONFIGS"] = 0
+    if decode_str:
+        _FLEX_PATCH_COUNTERS["AD_FLEX_DECODE_CONFIGS"] = 0
+    if bwd_str:
+        _FLEX_PATCH_COUNTERS["AD_BWD_OVERRIDE_CONFIGS"] = 0
+
+    global _FLEX_ATEXIT_REGISTERED
+    if not _FLEX_ATEXIT_REGISTERED:
+        import atexit
+        atexit.register(_verify_flex_overrides_fired)
+        _FLEX_ATEXIT_REGISTERED = True
+
     try:
         import torch._inductor.kernel.flex.flex_attention as flex_attn
         from torch._inductor.template_heuristics.triton import FlexConfig  # noqa: F401
@@ -732,12 +750,6 @@ def _apply_flex_overrides():
             )
         except ImportError:
             print("[ad_run_benchmark] WARNING: Could not import FlexBwDConfig; skipping bwd config override")
-
-    global _FLEX_ATEXIT_REGISTERED
-    if not _FLEX_ATEXIT_REGISTERED:
-        import atexit
-        atexit.register(_verify_flex_overrides_fired)
-        _FLEX_ATEXIT_REGISTERED = True
 
 
 def _coerce_value(v: str):
