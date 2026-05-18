@@ -152,6 +152,11 @@ BENCHMARKS = {
     # is_td_patched=False so the provider key stays 'triton' (matches the
     # dispatcher's providers_filter=["triton"]). The TD ("tensor descriptors")
     # variant requires patching the vllm source first via vllm/run_benchmark.sh.
+    #
+    # The fp8 entries set env_before_import={"FP8": "1"} which is applied via
+    # os.environ.setdefault — i.e. a caller-set FP8=0 would shadow it and
+    # silently downgrade the run to BF16. If you're driving these keys from
+    # TX or a shell, do NOT pre-set FP8 in the environment.
     "vllm_unified_attention_bf16": {
         "module": "vllm.unified_attention.unified_attention_benchmark",
         "factory": "get_unified_attention_benchmark",

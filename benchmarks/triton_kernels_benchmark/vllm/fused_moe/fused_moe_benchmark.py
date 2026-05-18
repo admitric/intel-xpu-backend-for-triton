@@ -30,6 +30,12 @@ from vllm_xpu_kernels.fused_moe_interface import cutlass_grouped_gemm_xe2 as syc
 # Importing this module in cross-compile mode has no loaded Triton driver.
 DEVICE = None
 
+# DEVICE_TOTAL_MEMORY_BYTES is initialized at module scope, but is used by
+# filter_by_memory(MM_CONFIGS) below — also at module scope — so it must
+# resolve before the factory runs. This is safe under AD_MOCK_GPU=1
+# because Layer-1 of the cross-compile mock (in scripts/ad_run_benchmark.py)
+# patches torch.xpu.is_available() to True and supplies a 128GB total
+# memory before any benchmark module is imported.
 DEVICE_TOTAL_MEMORY_BYTES = benchmark_suite.get_total_gpu_memory_bytes()
 
 
