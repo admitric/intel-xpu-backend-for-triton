@@ -26,7 +26,9 @@ from tests.kernels.moe.utils import make_quantized_test_activations, make_test_w
 from vllm.model_executor.layers.fused_moe.fused_moe import invoke_fused_moe_triton_kernel, get_default_config
 from vllm_xpu_kernels.fused_moe_interface import cutlass_grouped_gemm_xe2 as sycl_tla_grouped_gemm
 
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
+# Initialize the active device after the dispatcher's GPU mock is active.
+# Importing this module in cross-compile mode has no loaded Triton driver.
+DEVICE = None
 
 DEVICE_TOTAL_MEMORY_BYTES = benchmark_suite.get_total_gpu_memory_bytes()
 
@@ -273,6 +275,10 @@ def ref_grouped_gemm(input_A, input_B, topk_ids, topk):
 
 
 def get_fused_moe_benchmark(providers_filter: Optional[list[str]] = None, is_fp8=False, is_td_patched=False):
+    global DEVICE
+    if DEVICE is None:
+        DEVICE = triton.runtime.driver.active.get_active_torch_device()
+
     supported_providers = {
         'triton' + ('-td' if is_td_patched else ''): 'triton' + ('-td' if is_td_patched else ''),
         'sycl-tla': 'sycl-tla',
