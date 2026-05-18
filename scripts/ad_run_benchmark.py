@@ -328,6 +328,8 @@ def _mock_gpu_for_cross_compile():
             return {"max_work_group_size": 1024}
         def get_current_device(self):
             return 0
+        def unload_module(self, module):
+            pass  # no-op: called by CompiledKernel.__del__ for mock modules
 
     # Patch XPUDriver methods
     XPUDriver.get_current_device = lambda self=None: 0
@@ -397,6 +399,24 @@ def _mock_gpu_for_cross_compile():
 
     # ---- Layer 4: torch.compile + TorchInductor (FlexAttention) support ----
     #
+    # Gate: drop PagedNoop from AD_FLEX_MASKS under compile-only.
+    # PagedNoop's score_mod/mask_mod (from PagedAttention.get_score_mod /
+    # convert_logical_block_mask) performs a block-table gather that requires
+    # buffer creation inside PointwiseSubgraphLowering.  Only
+    # zeros_and_scatter.default is in allowed_mutations, so the gather raises
+    # SubgraphLoweringException.  Real GPUs support paged attention natively;
+    # the cross-compile mock does not.
+    _flex_masks_env = os.environ.get("AD_FLEX_MASKS", "")
+    if os.environ.get("AD_COMPILE_ONLY") and "PagedNoop" in _flex_masks_env:
+        _new_masks = ",".join(m for m in _flex_masks_env.split(",") if m != "PagedNoop")
+        os.environ["AD_FLEX_MASKS"] = _new_masks
+        print(
+            "[mock] AD_COMPILE_ONLY: dropping PagedNoop from AD_FLEX_MASKS "
+            "(block-table gather not lowerable in pointwise subgraph). "
+            "See GOTCHAS.md 'PagedNoop mask_mod'.",
+            file=sys.stderr,
+        )
+
     # FlexAttention uses torch.compile → TorchDynamo → TorchInductor → Triton.
     # Three problems arise on a GPU-less machine:
     #
@@ -964,6 +984,13 @@ def _patch_compile_only():
                 return
             self.module = "dummy"
             self.function = None
+            # CompiledKernel.run is a property: if self._run is None it calls
+            # _init_handles() to set it.  Without a real XPU device the normal
+            # path would fail, and the noop stub must provide a callable so that
+            # triton_heuristics.py's autotuner can place `runner = binary.run`
+            # in the launcher scope and call it without TypeError.
+            # XPULauncher.__call__ is already patched to a no-op above.
+            self._run = lambda *a, **kw: None
             self.n_regs = self.n_spills = self.n_max_threads = 0
         CompiledKernel._init_handles = _noop_init_handles
 
