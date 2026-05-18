@@ -146,6 +146,38 @@ BENCHMARKS = {
         "attr": "benchmark",
         "flex_attention": True,
     },
+
+    # --- vLLM kernels (POC from origin/chengjun/main-dev) ---
+    # See BigPicture/triton_kernels_for_llm/vllm_kernels_catalog.md.
+    # is_td_patched=False so the provider key stays 'triton' (matches the
+    # dispatcher's providers_filter=["triton"]). The TD ("tensor descriptors")
+    # variant requires patching the vllm source first via vllm/run_benchmark.sh.
+    "vllm_unified_attention_bf16": {
+        "module": "vllm.unified_attention.unified_attention_benchmark",
+        "factory": "get_unified_attention_benchmark",
+        "kwargs": {"is_fp8": False},
+    },
+    "vllm_unified_attention_fp8": {
+        "module": "vllm.unified_attention.unified_attention_benchmark",
+        "factory": "get_unified_attention_benchmark",
+        "kwargs": {"is_fp8": True},
+        "env_before_import": {"FP8": "1"},
+    },
+    "vllm_fused_moe": {
+        "module": "vllm.fused_moe.fused_moe_benchmark",
+        "factory": "get_fused_moe_benchmark",
+    },
+    "vllm_batched_moe_bf16": {
+        "module": "vllm.batched_moe.batched_moe_benchmark",
+        "factory": "get_batched_mm_benchmark",
+        "kwargs": {"is_fp8": False},
+    },
+    "vllm_batched_moe_fp8": {
+        "module": "vllm.batched_moe.batched_moe_benchmark",
+        "factory": "get_batched_mm_benchmark",
+        "kwargs": {"is_fp8": True},
+        "env_before_import": {"FP8": "1"},
+    },
 }
 
 
@@ -944,6 +976,52 @@ def _force_autotune_config(module):
         print("[ad_run_benchmark] WARNING: No Autotuner objects found in module")
 
 
+def _patch_vllm_for_mock():
+    """Layer 5 (vLLM-only): make the vllm test tree resolvable as a
+    top-level `tests` package.
+
+    batched_moe_benchmark.py does:
+        from tests.kernels.moe.utils import make_quantized_test_activations, ...
+        from tests.kernels.quant_utils import native_batched_masked_quant_matmul
+    scripts/vllm/install-vllm.sh copies vllm/tests/ into
+    benchmarks/triton_kernels_benchmark/vllm/batched_moe/tests/ at install
+    time, but `tests` is not a top-level package by default. We prepend the
+    batched_moe directory to sys.path so `tests.kernels.*` resolves
+    naturally, then stub one transitive submodule
+    (`tests.kernels.quantization.nvfp4_utils`) whose __init__.py-less parent
+    is skipped by find_packages() and therefore missing from the wheel.
+
+    Only invoked when AD_MOCK_GPU=1 and the chosen benchmark key starts
+    with 'vllm_'. Idempotent.
+    """
+    import importlib.util
+    spec = importlib.util.find_spec(
+        "triton_kernels_benchmark.vllm.batched_moe.batched_moe_benchmark"
+    )
+    if spec is not None and spec.origin:
+        batched_moe_dir = os.path.dirname(spec.origin)
+        if batched_moe_dir not in sys.path:
+            sys.path.insert(0, batched_moe_dir)
+            print(f"[mock_gpu] Layer 5: prepended {batched_moe_dir} to sys.path "
+                  "(makes `tests.kernels.*` importable for batched_moe)")
+
+    # vllm/tests/kernels/quantization/ has no __init__.py in the source tree,
+    # so find_packages() skips it and the wheel ships an incomplete tree.
+    # tests/kernels/moe/utils.py imports FLOAT4_E2M1_MAX, FLOAT8_E4M3_MAX from
+    # nvfp4_utils — used only inside a function, so any value satisfies
+    # module-load. Stub the parent package and the leaf module.
+    for modpath, attrs in [
+        ("tests.kernels.quantization", {}),
+        ("tests.kernels.quantization.nvfp4_utils",
+         {"FLOAT4_E2M1_MAX": 1.0, "FLOAT8_E4M3_MAX": 1.0}),
+    ]:
+        if modpath not in sys.modules:
+            mod = types.ModuleType(modpath)
+            for k, v in attrs.items():
+                setattr(mod, k, v)
+            sys.modules[modpath] = mod
+
+
 def _patch_compile_only():
     """Replace do_bench with a stub that calls fn() once for compilation.
 
@@ -1300,6 +1378,8 @@ def main():
     # 1.5. Mock GPU subsystem for cross-compilation on GPU-less machines
     if os.environ.get("AD_MOCK_GPU") == "1":
         _mock_gpu_for_cross_compile()
+        if key.startswith("vllm_"):
+            _patch_vllm_for_mock()
 
     # 2. Set env vars before import (some modules read them at import time)
     for k, v in spec.get("env_before_import", {}).items():
