@@ -117,3 +117,7 @@ AGENTS.override.md
 /sglang/
 /Liger-Kernel/
 /wheels/
+
+# vllm test tree copied by scripts/vllm/install-vllm.sh (sits inside tracked
+# benchmarks/ tree but is install-script output, not source).
+benchmarks/triton_kernels_benchmark/vllm/batched_moe/tests/
