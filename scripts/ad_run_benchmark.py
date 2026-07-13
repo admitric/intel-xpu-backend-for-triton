@@ -183,6 +183,19 @@ BENCHMARKS = {
         "kwargs": {"is_fp8": True},
         "env_before_import": {"FP8": "1"},
     },
+
+    # --- Customer kernels (triton-provider only, module-level get_benchmark) ---
+    # Both use @triton.autotune, so per-config table rows can be produced by
+    # pinning one config per run via AD_TRITON_AUTOTUNE_CONFIG (and shapes via
+    # AD_TRITON_SIZES) from the TX config file.
+    "swiglu": {                       # fused two-GEMM SwiGLU (GSD-13003)
+        "module": "fused_gemm_benchmark",
+        "factory": "get_benchmark",
+    },
+    "batched_attn": {                 # varlen/segment-packed flash attn fwd (GSD-12980)
+        "module": "batched_flash_attention_benchmark",
+        "factory": "get_benchmark",
+    },
 }
 
 

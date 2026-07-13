@@ -134,3 +134,37 @@ def test_force_autotune_config_applies_when_schema_fully_covered(clean_env):
     assert str(only.kwargs["grf_mode"]) == "256"
     assert only.num_warps == 16
     assert only.num_stages == 2
+
+
+# Customer-kernel registry entries. Kept as a static structural check (no
+# import) because both modules run torch.xpu.get_device_name() at module
+# scope, which requires a GPU that CI / a dev box may not have.
+_BENCHMARKS_DIR = SCRIPTS_DIR.parent / "benchmarks" / "triton_kernels_benchmark"
+
+
+@pytest.mark.parametrize(
+    "key, module",
+    [
+        ("swiglu", "fused_gemm_benchmark"),
+        ("batched_attn", "batched_flash_attention_benchmark"),
+    ],
+)
+def test_customer_kernel_registered(key, module):
+    """swiglu / batched_attn resolve to a get_benchmark factory module."""
+    assert key in ad_run_benchmark.BENCHMARKS, (
+        f"{key!r} missing from BENCHMARKS; keys: "
+        f"{sorted(ad_run_benchmark.BENCHMARKS)}"
+    )
+    spec = ad_run_benchmark.BENCHMARKS[key]
+    assert spec["module"] == module
+    assert spec.get("factory") == "get_benchmark", (
+        f"{key!r} must use the get_benchmark factory, got {spec}"
+    )
+    assert "attr" not in spec, f"{key!r} should not mix attr with factory"
+
+    # The referenced module must exist and expose get_benchmark (static check).
+    src_path = _BENCHMARKS_DIR / f"{module}.py"
+    assert src_path.is_file(), f"benchmark module not found: {src_path}"
+    assert "def get_benchmark(" in src_path.read_text(), (
+        f"{module}.py does not define get_benchmark()"
+    )
