@@ -939,8 +939,18 @@ def _force_autotune_config(module):
                     merged_top[k] = getattr(matched, k)
             obj.configs = [triton.Config(filtered_kwargs, **merged_top)]
         else:
-            # Create a new Config with the specified params
-            new_cfg = triton.Config(effective_kwargs, **top_level)
+            # No baked config matched this pin (e.g. a grf_mode / loop_distribute
+            # combination absent from the autotune list). Build a Config directly
+            # from the pinned kwargs. Unlike the matched branch above we have no
+            # existing Config to copy types from, so normalize options whose
+            # Triton type is fixed: grf_mode is a string ('128'/'256'/'512'/
+            # 'auto'/'default'), never an int. _coerce_value turns "256" into the
+            # int 256, which the Intel backend's add_hoist_layout_conversions(pm,
+            # str) and grf_mode == '256' checks reject -> TypeError at compile.
+            normalized_kwargs = dict(effective_kwargs)
+            if "grf_mode" in normalized_kwargs:
+                normalized_kwargs["grf_mode"] = str(normalized_kwargs["grf_mode"])
+            new_cfg = triton.Config(normalized_kwargs, **top_level)
             obj.configs = [new_cfg]
         return True
 
