@@ -18,4 +18,5 @@ add_triton_library(TritonIntelTransforms
   MLIRTransformUtils
   TritonIntelAnalysis
   TritonIR
+  TritonTransforms
 )

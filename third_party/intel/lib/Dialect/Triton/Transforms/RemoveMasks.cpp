@@ -10,6 +10,8 @@
 #include "mlir/Support/LLVM.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/Transforms/LoopPeeling.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/Debug.h"
@@ -187,6 +189,198 @@ static Operation *dropMask(Operation *op, bool maskVal) {
       });
 
   return nullptr;
+}
+
+//===--------------------------------------------------------------------===//
+// Peeling-based boundary-mask removal.
+//
+// The validators below remove a mask when it is provably redundant across the
+// *whole* loop (static drop) or under a runtime *whole-loop* condition (loop
+// versioning). Neither helps the common "only the last tile is partial" case
+// with a dynamic bound, e.g. a K-loop
+//
+//   for iv in [lb, N) step END:  load(ptr, mask = (iv + [0..END)) < N)
+//
+// where `N` is a runtime value. Here the mask is true on every iteration
+// except (possibly) the last, so *peeling* the final iteration makes the mask
+// redundant in the steady-state loop while a single masked tail iteration
+// preserves correctness. This is strictly more general than versioning for
+// this pattern: it needs no whole-loop condition and works for any `N`.
+//
+// Detection is purely relational (no constant-range reasoning): the mask must
+// be `(IV_equiv + make_range(0, END)) {slt|ult|sle|ule} splat(bound)` with
+// `bound == loop upper bound` and `END == loop step`. Those two identities are
+// exactly what guarantees "fails only on the last tile".
+//===--------------------------------------------------------------------===//
+
+// Peel only shape/type-broadcasting ops (splat/broadcast/expand/ext), stopping
+// at the first "real" value. Unlike `getFinalValue`, it does NOT resolve loop
+// iter-args to their init value, so the loop IV / IV-equivalent iter-arg is
+// preserved for `isIVOrEquivalent`.
+static Value peelBroadcasts(Value v) {
+  while (Operation *op = v.getDefiningOp()) {
+    if (isa<tt::SplatOp, tt::BroadcastOp, tt::ExpandDimsOp, arith::ExtSIOp,
+            arith::ExtUIOp, arith::IndexCastOp, arith::TruncIOp>(op))
+      v = op->getOperand(0);
+    else
+      break;
+  }
+  return v;
+}
+
+static std::optional<int64_t> getIntConstant(Value v) {
+  APInt c;
+  if (v && matchPattern(v, m_ConstantInt(&c)))
+    return c.getSExtValue();
+  return std::nullopt;
+}
+
+// True if `v` is the loop IV, or an iter_arg equivalent to it (init == lower
+// bound, yield == self + step). Mirrors the equivalence check used by
+// `RemovableMaskValidator::getIVEquivalentRange`, without needing the solver.
+static bool isIVOrEquivalent(scf::ForOp forOp, Value v) {
+  if (v == forOp.getInductionVar())
+    return true;
+  auto blockArg = dyn_cast<BlockArgument>(v);
+  if (!blockArg || blockArg.getOwner() != forOp.getBody())
+    return false;
+  unsigned idx = blockArg.getArgNumber();
+  if (idx == 0) // the induction variable itself is handled above
+    return false;
+  unsigned iterIdx = idx - 1; // arg 0 is the IV
+  if (iterIdx >= forOp.getNumRegionIterArgs())
+    return false;
+  std::optional<int64_t> lb = getIntConstant(forOp.getLowerBound());
+  std::optional<int64_t> step = getIntConstant(forOp.getStep());
+  if (!lb || !step)
+    return false;
+  if (getIntConstant(forOp.getInitArgs()[iterIdx]) != lb)
+    return false;
+  auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  auto add = yield.getOperand(iterIdx).getDefiningOp<arith::AddIOp>();
+  if (!add)
+    return false;
+  Value iterArg = forOp.getRegionIterArg(iterIdx);
+  bool lhsIsArg = add.getLhs() == iterArg, rhsIsArg = add.getRhs() == iterArg;
+  if (!lhsIsArg && !rhsIsArg)
+    return false;
+  Value other = lhsIsArg ? add.getRhs() : add.getLhs();
+  return getIntConstant(other) == step;
+}
+
+// Return true if `mask` is a per-tile boundary predicate that is redundant on
+// every iteration except (possibly) the last -- see the block comment above.
+static bool isLastTileBoundaryMask(scf::ForOp forOp, Value mask) {
+  Value f = tt::intel::getFinalValue(mask);
+  auto cmp = dyn_cast_or_null<arith::CmpIOp>(f.getDefiningOp());
+  if (!cmp)
+    return false;
+  switch (cmp.getPredicate()) {
+  case arith::CmpIPredicate::slt:
+  case arith::CmpIPredicate::ult:
+  case arith::CmpIPredicate::sle:
+  case arith::CmpIPredicate::ule:
+    break;
+  default:
+    return false;
+  }
+
+  // RHS must equal the loop's upper bound (`bound == N`). Aggressive peeling is
+  // fine here: the bound is a scalar, not the IV.
+  if (tt::intel::getFinalValue(cmp.getRhs()) !=
+      tt::intel::getFinalValue(forOp.getUpperBound()))
+    return false;
+
+  // LHS must be addi(IV_equiv, make_range(0, END)) with END == step.
+  auto add = dyn_cast_or_null<arith::AddIOp>(
+      tt::intel::getFinalValue(cmp.getLhs()).getDefiningOp());
+  if (!add)
+    return false;
+  std::optional<int64_t> step = getIntConstant(forOp.getStep());
+  if (!step)
+    return false;
+  auto matches = [&](Value rangeSide, Value ivSide) {
+    auto mr = dyn_cast_or_null<tt::MakeRangeOp>(
+        peelBroadcasts(rangeSide).getDefiningOp());
+    if (!mr || mr.getStart() != 0 || (mr.getEnd() - mr.getStart()) != *step)
+      return false;
+    return isIVOrEquivalent(forOp, peelBroadcasts(ivSide));
+  };
+  return matches(add.getLhs(), add.getRhs()) ||
+         matches(add.getRhs(), add.getLhs());
+}
+
+// Peel the final iteration of `forOp` when it carries a last-tile boundary
+// predicate, and remove that predicate from the steady-state loop (the peeled
+// tail keeps it). Two forms are handled:
+//   - a masked `tt.load` / `tt.store` whose mask is the boundary  -> drop mask;
+//   - an `arith.andi(X, boundary)` feeding e.g. a `tl.where` select (the
+//     `mask & (offset_n < N)` pattern) -> replace the `andi` with `X`, so the
+//     select is guarded by the real mask only.
+// Returns true if the loop was peeled.
+static bool peelLoopForBoundaryMasks(scf::ForOp forOp) {
+  SmallVector<Operation *> toUnmask;
+  // (andi op, operand to keep) recorded *before* peeling: `isLastTileBoundaryMask`
+  // compares against the loop upper bound, which peeling mutates.
+  SmallVector<std::pair<arith::AndIOp, Value>> andisToSimplify;
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    if (auto ld = dyn_cast<tt::LoadOp>(&op)) {
+      if (ld.getMask() && isLastTileBoundaryMask(forOp, ld.getMask()))
+        toUnmask.push_back(&op);
+    } else if (auto st = dyn_cast<tt::StoreOp>(&op)) {
+      if (st.getMask() && isLastTileBoundaryMask(forOp, st.getMask()))
+        toUnmask.push_back(&op);
+    } else if (auto andi = dyn_cast<arith::AndIOp>(&op)) {
+      if (isLastTileBoundaryMask(forOp, andi.getLhs()))
+        andisToSimplify.push_back({andi, andi.getRhs()});
+      else if (isLastTileBoundaryMask(forOp, andi.getRhs()))
+        andisToSimplify.push_back({andi, andi.getLhs()});
+    }
+  }
+  if (toUnmask.empty() && andisToSimplify.empty())
+    return false;
+
+  // Experimental cost gate. Peeling clones the entire loop body into a
+  // once-executed trailing `scf.if`; the benefit (removing the per-iteration
+  // boundary guard) is per-iteration and independent of body size, so for a
+  // large body the code-size cost can outweigh the gain. Skip peeling when it is
+  // disabled, or when the body op count exceeds a threshold. The op count is a
+  // first-order model; it could be refined to weight expensive ops (e.g.
+  // isExpensiveLoadOrStore).
+  if (tt::tools::getBoolEnv("TRITON_INTEL_DISABLE_MASK_PEEL"))
+    return false;
+  unsigned maxBodyOps = 128;
+  if (std::string v = tt::tools::getStrEnv("TRITON_INTEL_MASK_PEEL_MAX_BODY_OPS");
+      !v.empty()) {
+    unsigned parsed = 0;
+    if (!StringRef(v).getAsInteger(/*Radix=*/10, parsed))
+      maxBodyOps = parsed;
+  }
+  unsigned bodyOps = 0;
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    (void)op;
+    ++bodyOps;
+  }
+  if (bodyOps > maxBodyOps)
+    return false;
+
+  // Clone the last iteration into a trailing `scf.if` (keeps its masks) and
+  // shrink the loop upper bound by one step. The original body ops stay in
+  // `forOp`, so the collected ops/operands remain valid.
+  mlir::triton::peelLoopEpilogue(forOp);
+
+  // The steady-state loop is now provably in-bounds. Drop masked loads (rewrite
+  // to a new unmasked op, then erase the dead original) and collapse boundary
+  // `andi`s to their non-boundary operand.
+  for (Operation *op : toUnmask) {
+    dropMask(op, /*maskVal=*/true);
+    op->erase();
+  }
+  for (auto &[andi, keep] : andisToSimplify) {
+    andi.getResult().replaceAllUsesWith(keep);
+    andi.erase();
+  }
+  return true;
 }
 
 // Abstract base class for mask validators.
@@ -1116,6 +1310,22 @@ public:
 
     if (failed(solver->initializeAndRun(getOperation())))
       return signalPassFailure();
+
+    // Peel the final iteration of loops whose masks are last-tile boundary
+    // predicates (dynamic bound == loop upper bound). This runs first because it
+    // rewrites loop structure; collect the loops up-front to avoid mutating the
+    // IR while walking it. See `peelLoopForBoundaryMasks` for the rationale.
+    {
+      SmallVector<scf::ForOp> loops;
+      moduleOp->walk([&](scf::ForOp forOp) {
+        // Match the top-level, single-IV restriction of the other strategies.
+        if (forOp->getParentOfType<scf::ForOp>() || !forOp.getSingleInductionVar())
+          return;
+        loops.push_back(forOp);
+      });
+      for (scf::ForOp forOp : loops)
+        peelLoopForBoundaryMasks(forOp);
+    }
 
     // Remove masks if they are not necessary.
     moduleOp->walk<WalkOrder::PreOrder>([&](Operation *op) {
