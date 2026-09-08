@@ -9,32 +9,21 @@ import triton_kernels_benchmark as benchmark_suite
 
 def fwd_autotune_config() -> list[triton.Config]:
     return [
-        # triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=3, num_warps=8),
-        # triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_stages=3, num_warps=16),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 32, "START_M_AXIS": m, "START_QH_AXIS": qh, "START_B_AXIS": b},
-                      num_stages=3, num_warps=16)
-        for m, qh, b in [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)]
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_stages=3, num_warps=16),
     ]
 
 
 @triton.jit
 def mask_fn(q_attn_arg, k_attn_arg, q_offset, k_offset, TYPE: tl.constexpr):
-    # tril_causal = q_offset[:, None] >= k_offset[None, :]
-    # triu_causal = q_offset[:, None] <= k_offset[None, :]
-    #
-    # if TYPE == 1:
-    #     return ((triu_causal & ((q_attn_arg[:, None] == k_attn_arg[None, :]) | (k_attn_arg[None, :] == 0))) |
-    #             (q_offset[:, None] == k_offset[None, :]))
-    # return ((tril_causal & ((q_attn_arg[:, None] == k_attn_arg[None, :]) | (k_attn_arg[None, :] == 0))) |
-    #         (q_offset[:, None] == k_offset[None, :]))
-    same_arg = (q_attn_arg[:, None] == k_attn_arg[None, :]) | (k_attn_arg[None, :] == 0)
-    diag = q_offset[:, None] == k_offset[None, :]
+    tril_causal = q_offset[:, None] >= k_offset[None, :]
+    triu_causal = q_offset[:, None] <= k_offset[None, :]
+
     if TYPE == 1:
-        triu_causal = q_offset[:, None] <= k_offset[None, :]
-        return (triu_causal & same_arg) | diag
-    if TYPE == 2:
-        tril_causal = q_offset[:, None] >= k_offset[None, :]
-        return (tril_causal & same_arg) | diag
+        return ((triu_causal & ((q_attn_arg[:, None] == k_attn_arg[None, :]) | (k_attn_arg[None, :] == 0))) |
+                (q_offset[:, None] == k_offset[None, :]))
+    return ((tril_causal & ((q_attn_arg[:, None] == k_attn_arg[None, :]) | (k_attn_arg[None, :] == 0))) |
+            (q_offset[:, None] == k_offset[None, :]))
 
 
 def keep(config):
@@ -43,7 +32,7 @@ def keep(config):
     return m % n == 0
 
 
-@triton.autotune(list(filter(keep, fwd_autotune_config())), key=["QK_DIM", "V_DIM", "MASK_FN", "SPARSE_OPT", "MAX_LEN"])
+@triton.autotune(list(filter(keep, fwd_autotune_config())), key=["QK_DIM", "V_DIM", "MASK_FN", "SPARSE_OPT"])
 @triton.jit
 def fa_fwd_kernel(
     q_ptr,
@@ -57,22 +46,18 @@ def fa_fwd_kernel(
     cu_seqlens_k,
     q_head,
     kv_head,
-    scale: tl.float64,
+    scale,
     QK_DIM: tl.constexpr,
     V_DIM: tl.constexpr,
     MASK_FN: tl.constexpr,
     SPARSE_OPT: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    MAX_LEN: tl.constexpr,
-    START_M_AXIS: tl.constexpr = 0,
-    START_QH_AXIS: tl.constexpr = 1,
-    START_B_AXIS: tl.constexpr = 2,
 ):
     dtype = o_ptr.type.element_ty
-    start_m = tl.program_id(START_M_AXIS)
-    start_qh = tl.program_id(START_QH_AXIS)
-    start_b = tl.program_id(START_B_AXIS)
+    start_m = tl.program_id(0)
+    start_qh = tl.program_id(1)
+    start_b = tl.program_id(2)
     start_kvh = start_qh // (q_head // kv_head)
 
     q_start = tl.load(cu_seqlens_q + start_b)
@@ -192,18 +177,7 @@ def batched_attention(q, k, v, q_attn_arg, k_attn_arg, cu_seqlens_q, cu_seqlens_
     batch_size = cu_seqlens_q.shape[0] - 1
     o = q.new_empty(q_len, q_head, v_dim)
     l = q.new_empty(q_len, q_head, dtype=torch.float32)
-
-    def grid(META):
-        g = [0, 0, 0]
-        num_m = triton.cdiv(max_seqlen_q, META["BLOCK_M"])
-        num_qh = q_head
-        num_b = batch_size
-        g[META["START_M_AXIS"]] = num_m
-        g[META["START_QH_AXIS"]] = num_qh
-        g[META["START_B_AXIS"]] = num_b
-        return tuple(g)
-
-    # grid = lambda META: (triton.cdiv(max_seqlen_q, META["BLOCK_M"]), q_head, batch_size)
+    grid = lambda META: (triton.cdiv(max_seqlen_q, META["BLOCK_M"]), q_head, batch_size)
     fa_fwd_kernel[grid](
         q,
         k,
@@ -221,7 +195,6 @@ def batched_attention(q, k, v, q_attn_arg, k_attn_arg, cu_seqlens_q, cu_seqlens_
         V_DIM=v_dim,
         MASK_FN=mask_opt,
         SPARSE_OPT=sparse_opt,
-        MAX_LEN=max_seqlen_q,
     )
     return o
 
@@ -329,8 +302,7 @@ SEGMENT_CASES = build_cases()
 
 
 def build_segment_bitmap(boundaries: torch.Tensor, total_tokens: int, device: str) -> torch.Tensor:
-    # bitmap = torch.zeros(total_tokens, device=device, dtype=torch.int64)
-    bitmap = torch.zeros(total_tokens, device=device, dtype=torch.int32)
+    bitmap = torch.zeros(total_tokens, device=device, dtype=torch.int64)
     bitmap[boundaries[:-1]] = 1
     return bitmap
 
